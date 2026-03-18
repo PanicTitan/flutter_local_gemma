@@ -97,3 +97,7 @@ example/
     ├── test.png
     └── test.wav
 ```
+
+## Hugginface Token
+
+Replace the `hf_YOUR_TOKEN_HERE` for your real token in `flutter_local_gemma/example/lib/screens/benchmark_screen.dart`, `flutter_local_gemma/example/lib/utils/model_loader.dart`, `flutter_local_gemma/example/lib/testing/test_suite.dart`

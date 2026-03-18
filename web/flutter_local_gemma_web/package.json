@@ -1,0 +1,21 @@
+{
+    "name": "flutter_local_gemma_web",
+    "private": true,
+    "version": "0.0.0",
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "build": "tsc && vite build",
+        "preview": "vite preview --host"
+    },
+    "devDependencies": {
+        "typescript": "~5.9.3",
+        "vite": "^7.3.1"
+    },
+    "dependencies": {
+        "@huggingface/transformers": "^4.0.0-next.4",
+        "@litertjs/core": "^2.0.0",
+        "@mediapipe/tasks-genai": "^0.10.26",
+        "pdfjs-dist": "^5.4.624"
+    }
+}

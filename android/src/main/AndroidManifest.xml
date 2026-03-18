@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.flutter_local_gemma">
+
+    <!-- Required network permission for model downloads and web access -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Optional feature: plugins using GPU/OpenGL may require this -->
+    <!-- <uses-feature android:glEsVersion="0x00020000" android:required="false" /> -->
+        <!-- <uses-native-library android:name="libOpenCL-car.so" android:required="false"/>
+        <uses-native-library android:name="libOpenCL-pixel.so" android:required="false"/>
+        <uses-native-library android:name="libvndksupport.so" android:required="false"/>
+        <uses-native-library android:name="libOpenCL.so" android:required="false"/> -->
+</manifest>

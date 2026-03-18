@@ -1,0 +1,67 @@
+name: flutter_local_gemma
+description: "On-device AI inference for Flutter — Gemma 3 text generation, embeddings, and PDF processing on Android and Web."
+version: 0.1.0
+homepage: https://github.com/PanicTitan/flutter_local_gemma
+
+environment:
+  sdk: ^3.10.7
+  flutter: '>=3.3.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_web_plugins:
+    sdk: flutter
+
+  web: ^1.0.0
+  plugin_platform_interface: ^2.0.2
+
+  background_downloader: ^9.5.2 # android download
+  path_provider: ^2.1.5
+  collection: ^1.19.1
+
+  image: ^4.8.0
+  cross_file: ^0.3.5+2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.example.flutter_local_gemma
+        pluginClass: FlutterLocalGemmaPlugin
+      web:
+        pluginClass: FlutterLocalGemmaWeb
+        fileName: flutter_local_gemma_web.dart
+
+  assets:
+    - path: web/dist/gemma_web.js
+    - path: web/dist/ort-wasm-simd-threaded.asyncify.wasm
+
+    - path: web/pdfjs-dist/pdf.min.mjs
+    - path: web/pdfjs-dist/pdf.mjs
+    - path: web/pdfjs-dist/pdf.mjs.map
+    - path: web/pdfjs-dist/pdf.sandbox.min.mjs
+    - path: web/pdfjs-dist/pdf.sandbox.mjs
+    - path: web/pdfjs-dist/pdf.sandbox.mjs.map
+    - path: web/pdfjs-dist/pdf.worker.min.mjs
+    - path: web/pdfjs-dist/pdf.worker.mjs
+    - path: web/pdfjs-dist/pdf.worker.mjs.map
+
+    - path: web/@litertjs/core/wasm/litert_wasm_compat_internal.js
+    - path: web/@litertjs/core/wasm/litert_wasm_compat_internal.wasm
+    - path: web/@litertjs/core/wasm/litert_wasm_internal.js
+    - path: web/@litertjs/core/wasm/litert_wasm_internal.wasm
+    - path: web/@litertjs/core/wasm/litert_wasm_threaded_internal.js
+    - path: web/@litertjs/core/wasm/litert_wasm_threaded_internal.wasm
+
+    - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_internal.js
+    - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_internal.wasm
+    - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_nosimd_internal.js
+    - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_nosimd_internal.wasm
+
+      platforms: [web]

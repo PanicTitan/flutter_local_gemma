@@ -62,11 +62,13 @@ Supports **Android** (via LiteRT-LM) and **Web** (via MediaPipe GenAI + LiteRT W
 
 ## Installation
 
-Add the package to your `pubspec.yaml`:
+Add the package to your `pubspec.yaml` using the Git repository:
 
 ```yaml
 dependencies:
-  flutter_local_gemma: ^0.1.0
+  flutter_local_gemma:
+    git:
+      url: https://github.com/PanicTitan/flutter_local_gemma.git
 ```
 
 Then run:
@@ -107,31 +109,11 @@ Gemma 3n E2B INT4 requires approximately **2–3 GB of RAM** at runtime. On low-
 
 ## Web Setup
 
-### 1. COOP / COEP headers
+### Your may need this headers for production
 
-Flutter's dev server adds these automatically. For production, configure your server:
-
-**Nginx:**
-```nginx
+```txt
 add_header Cross-Origin-Opener-Policy same-origin;
 add_header Cross-Origin-Embedder-Policy require-corp;
-```
-
-**Firebase Hosting (`firebase.json`):**
-```json
-{
-  "hosting": {
-    "headers": [
-      {
-        "source": "**",
-        "headers": [
-          { "key": "Cross-Origin-Opener-Policy",  "value": "same-origin" },
-          { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" }
-        ]
-      }
-    ]
-  }
-}
 ```
 
 ### 2. No manual script tags needed

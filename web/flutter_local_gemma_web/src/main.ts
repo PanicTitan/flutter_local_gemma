@@ -35,7 +35,6 @@ const EMBEDDING_SEQ_LEN = 256;
 // ─── Module-level state ──────────────────────────────────────────────────────
 
 // LLM
-let llmInstance: any = null;
 type ActiveGeneration = { cancel: () => void };
 let activeGeneration: ActiveGeneration | null = null;
 
@@ -358,40 +357,58 @@ function _meanPool(output: Float32Array, mask: any, dim: number): Float32Array {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. MediaPipe GenAI LLM Engine
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. Hybrid Web LLM Engine (LiteRT-LM & MediaPipe Tasks GenAI)
 // ─────────────────────────────────────────────────────────────────────────────
 
+let engine: any = null;
+let conversation: any = null;
+let llmInstance: any = null;
+
 /**
- * Loads and initialises the MediaPipe GenAI LLM engine.
+ * Loads and initialises the appropriate LLM engine based on model type.
  *
  * @param options.assetBase          Base URL for bundled WASM assets.
  * @param options.baseOptions.modelPath  URL / OPFS object-URL of the model binary.
  * @param options.maxTokens          KV-cache capacity.
- * @param options.supportAudio       Whether to enable the audio modality.
+ * @param options.supportAudio       Passed to MediaPipe if supported.
+ * @param options.isGemma4           If true, forces LiteRT-LM engine.
  */
 (window as any).initLLM = async (options: any): Promise<boolean> => {
     try {
-        const { FilesetResolver, LlmInference } = await import('@mediapipe/tasks-genai');
-
-        const assetBase = options.assetBase;
-        if (!assetBase) throw new Error('[GemmaWeb] initLLM: assetBase is missing.');
-
         // Unload any previously loaded instance before creating a new one.
-        _releaseLlmInstance();
+        await _releaseLlmInstance();
 
-        const wasmPath = `${assetBase}@mediapipe/tasks-genai/wasm`;
-        console.log('[GemmaWeb] Loading MediaPipe GenAI WASM from', wasmPath);
+        const modelPath = options?.baseOptions?.modelPath ?? options?.modelPath;
+        const isTaskModel = modelPath?.endsWith('.task') || modelPath?.endsWith('.bin');
+        // Force MediaPipe if the file is a .task model, even for Gemma 4
+        const isGemma4 = options?.isGemma4 === true && !isTaskModel;
 
-        const resolver = await FilesetResolver.forGenAiTasks(wasmPath);
-        llmInstance = await LlmInference.createFromOptions(resolver, {
-            baseOptions: {
-                modelAssetPath: options?.baseOptions?.modelPath ?? options?.modelPath,
-            },
-            maxTokens: options.maxTokens ?? 4096,
-            maxNumImages: options.maxNumImages ?? 1,
-            supportAudio: !!options.supportAudio,
-            randomSeed: options.randomSeed ?? 101,
-        });
+        if (isGemma4) {
+            console.log('[GemmaWeb] Loading LiteRT-LM Engine (Gemma 4 path)...');
+            const { Engine } = await import('@litert-lm/core');
+            engine = await Engine.create({
+                model: modelPath,
+                mainExecutorSettings: {
+                    maxNumTokens: options.maxTokens ?? 4096,
+                }
+            });
+            conversation = await engine.createConversation();
+        } else {
+            console.log('[GemmaWeb] Loading MediaPipe Tasks GenAI (Gemma 3 path)...');
+            const { FilesetResolver, LlmInference } = await import('@mediapipe/tasks-genai');
+            const assetBase = options.assetBase;
+            if (!assetBase) throw new Error('[GemmaWeb] initLLM: assetBase is missing.');
+            const wasmPath = `${assetBase}@mediapipe/tasks-genai/wasm`;
+            const resolver = await FilesetResolver.forGenAiTasks(wasmPath);
+            llmInstance = await LlmInference.createFromOptions(resolver, {
+                baseOptions: { modelAssetPath: modelPath },
+                maxTokens: options.maxTokens ?? 4096,
+                maxNumImages: (options.maxNumImages && options.maxNumImages > 0) ? options.maxNumImages : undefined,
+                supportAudio: !!options.supportAudio,
+                randomSeed: options.randomSeed ?? 101,
+            });
+        }
 
         console.log('[GemmaWeb] LLM engine ready.');
         return true;
@@ -403,36 +420,86 @@ function _meanPool(output: Float32Array, mask: any, dim: number): Float32Array {
 
 /**
  * Starts an async generation and streams tokens via [callback].
- *
- * @param parts    Array of content objects understood by MediaPipe (strings,
- *                 image / audio source objects).
- * @param callback Called with (partialText, isDone) for every token event.
  */
 (window as any).generateResponse = (
     parts: any[],
     callback: (partial: string, done: boolean) => void,
 ): void => {
-    if (!llmInstance) throw new Error('[GemmaWeb] LLM not initialised.');
+    if (engine && conversation) {
+        // LiteRT-LM path
+        // LiteRT-LM path
+        const contentItems = parts.map(p => {
+            if (typeof p === 'string') {
+                return { type: 'text', text: p };
+            } else if (p && p.imageSource) {
+                // Pass base64 data URL as 'path' or 'text' depending on what LiteRT expects.
+                // We'll pass it as 'text' since it's a data URL, but also 'path' just in case.
+                return { type: 'image', text: p.imageSource, path: p.imageSource };
+            } else if (p && p.audioSource) {
+                return { type: 'audio', text: p.audioSource, path: p.audioSource };
+            }
+            return { type: 'text', text: String(p) };
+        });
 
-    const promise = llmInstance.generateResponse(
-        parts,
-        (partial: string, done: any) => callback(partial, !!done),
-    );
+        let isCancelled = false;
+        activeGeneration = {
+            cancel: () => {
+                isCancelled = true;
+                conversation?.cancel?.();
+            },
+        };
 
-    activeGeneration = {
-        cancel: () => {
-            llmInstance?.cancelProcessing?.();
-        },
-    };
+        const message = { role: 'user', content: contentItems };
+        const stream = conversation.sendMessageStreaming(message);
 
-    // Swallow the promise here; errors surface via the callback's done=true path.
-    promise.catch((err: any) => {
-        if (!String(err).includes('cancel')) {
-            console.error('[GemmaWeb] generateResponse error:', err);
-        }
-    }).finally(() => {
-        activeGeneration = null;
-    });
+        (async () => {
+            try {
+                for await (const chunk of stream) {
+                    if (isCancelled) break;
+                    if (typeof chunk.content === 'string') {
+                        callback(chunk.content, false);
+                    } else if (Array.isArray(chunk.content)) {
+                        for (const item of chunk.content) {
+                            if (item.type === 'text' && item.text) {
+                                callback(item.text, false);
+                            }
+                        }
+                    }
+                }
+            } catch (err: any) {
+                if (!String(err).includes('cancel') && !isCancelled) {
+                    console.error('[GemmaWeb] generateResponse error:', err);
+                }
+            } finally {
+                activeGeneration = null;
+                if (!isCancelled) {
+                    callback('', true);
+                }
+            }
+        })();
+    } else if (llmInstance) {
+        // MediaPipe path
+        const promise = llmInstance.generateResponse(
+            parts,
+            (partial: string, done: any) => callback(partial, !!done),
+        );
+
+        activeGeneration = {
+            cancel: () => {
+                llmInstance?.cancelProcessing?.();
+            },
+        };
+
+        promise.catch((err: any) => {
+            if (!String(err).includes('cancel')) {
+                console.error('[GemmaWeb] generateResponse error:', err);
+            }
+        }).finally(() => {
+            activeGeneration = null;
+        });
+    } else {
+        throw new Error('[GemmaWeb] LLM not initialised.');
+    }
 };
 
 /** Cancels the in-flight generation. No-op if nothing is running. */
@@ -442,21 +509,29 @@ function _meanPool(output: Float32Array, mask: any, dim: number): Float32Array {
 };
 
 /**
- * Fully releases the LLM instance and all associated GPU/WebAssembly memory.
- * After this call, `initLLM` must be called before generating again.
+ * Fully releases the active LLM instance and all associated WebGPU/WASM memory.
  */
-(window as any).unloadLLM = (): void => {
+(window as any).unloadLLM = async (): Promise<void> => {
     // Stop any running generation first.
     activeGeneration?.cancel();
     activeGeneration = null;
 
-    _releaseLlmInstance();
+    await _releaseLlmInstance();
     console.log('[GemmaWeb] LLM unloaded.');
 };
 
-/** Internal helper: closes and nulls the llmInstance reference. */
-function _releaseLlmInstance(): void {
-    try { llmInstance?.close?.(); } catch { /* ignore */ }
+/** Internal helper: deletes active engine resources. */
+async function _releaseLlmInstance(): Promise<void> {
+    try {
+        conversation = null;
+        if (engine) {
+            await engine.delete();
+        }
+        if (llmInstance) {
+            llmInstance.close();
+        }
+    } catch { /* ignore */ }
+    engine = null;
     llmInstance = null;
 }
 
@@ -769,4 +844,102 @@ function _releaseLlmInstance(): void {
 
     console.log(`[GemmaWeb] Cache Storage purge freed ~${freed} bytes.`);
     return freed;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. JS Skill Executor (Iframe-based)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Executes a JS skill's HTML code inside a sandboxed iframe.
+ * Exposes a standard callback mechanism matching the Android implementation.
+ *
+ * @param scriptHtml  The full HTML code of the JS skill (typically load from SKILL.md/index.html).
+ * @param argsJson    The JSON-serialized arguments to pass to the skill function.
+ * @param timeoutMs   Timeout in milliseconds (defaults to 30000).
+ */
+(window as any).executeJsSkill = async (
+    scriptHtml: string,
+    argsJson: string,
+    secret: string,
+    timeoutMs: number = 30000
+): Promise<string> => {
+    return new Promise<string>((resolve) => {
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        document.body.appendChild(iframe);
+
+        const timer = setTimeout(() => {
+            cleanup();
+            resolve(JSON.stringify({ error: "Timeout executing skill", result: null }));
+        }, timeoutMs);
+
+        const cleanup = () => {
+            clearTimeout(timer);
+            if (iframe.parentNode) {
+                iframe.parentNode.removeChild(iframe);
+            }
+        };
+
+        // We can expose a callback function inside the iframe
+        (iframe.contentWindow as any).AiEdgeGallery = {
+            onResultReady: (result: string) => {
+                cleanup();
+                resolve(result);
+            }
+        };
+
+        const doc = iframe.contentDocument || iframe.contentWindow?.document;
+        if (!doc) {
+            cleanup();
+            resolve(JSON.stringify({ error: "Could not access iframe document", result: null }));
+            return;
+        }
+
+        doc.open();
+        doc.write(scriptHtml);
+        doc.close();
+
+        // Evaluate script in the context of the iframe window
+        const win = iframe.contentWindow as any;
+
+        // Wait for page to finish loading or for ai_edge_gallery_get_result to be defined
+        const checkAndExecute = async () => {
+            const startTs = Date.now();
+            while (true) {
+                if (typeof win.ai_edge_gallery_get_result === 'function') {
+                    break;
+                }
+                await new Promise(r => setTimeout(r, 100));
+                if (Date.now() - startTs > 10000) {
+                    break;
+                }
+            }
+
+            try {
+                if (typeof win.ai_edge_gallery_get_result === 'function') {
+                    // Standard Edge Gallery protocol expects a JSON string
+                    const result = await win.ai_edge_gallery_get_result(argsJson, secret);
+                    const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+                    cleanup();
+                    resolve(resultStr);
+                } else {
+                    cleanup();
+                    resolve(JSON.stringify({ error: "ai_edge_gallery_get_result not defined", result: null }));
+                }
+            } catch (e: any) {
+                cleanup();
+                resolve(JSON.stringify({ error: e.message || String(e), result: null }));
+            }
+        };
+
+        // Trigger after a short delay to ensure iframe is loaded
+        if (doc.readyState === 'complete') {
+            checkAndExecute();
+        } else {
+            iframe.onload = () => {
+                checkAndExecute();
+            };
+        }
+    });
 };

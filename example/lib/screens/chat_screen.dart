@@ -7,6 +7,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:flutter_local_gemma/flutter_local_gemma.dart';
 
 import '../app_state.dart';
+import '../demo_skills.dart';
 import '../utils/model_loader.dart';
 import '../widgets/model_status_chip.dart';
 import '../widgets/token_counter_bar.dart';
@@ -20,9 +21,12 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   // ── Chat state ─────────────────────────────────────────────────────────────
-  GemmaChat? _chat;
+  /// The active chat session. Typed as [BaseChat] so [GemmaChat] and
+  /// [AgentChat] can be used interchangeably without casting.
+  BaseChat? _chat;
   bool _isGenerating = false;
   String _streamingBuffer = '';
+  AgentTurn? _currentAgentTurn;
   String? _operationLabel; // shown in the status banner
 
   // ── Input ──────────────────────────────────────────────────────────────────
@@ -37,11 +41,21 @@ class _ChatScreenState extends State<ChatScreen> {
   // ── Settings ───────────────────────────────────────────────────────────────
   bool   _useStream  = true;
   bool   _jsonMode   = false;
+  bool   _enableThinking = false;
+  bool   _enableSkills = false;
+  bool   _nativeToolCalling = true;
+  int    _maxToolLoops = 10;
+  bool   _enableMtp = true;
+  bool   _enableMultimodality = true;
   String _customSchema = '';
   double _loadProgress = 0;
 
   // ── Token tracking ─────────────────────────────────────────────────────────
   int _inputPendingTokens = 0;
+
+  // ── Skills Tracking ────────────────────────────────────────────────────────
+  List<GemmaSkill>? _allSkills;
+  final Map<String, bool> _skillToggles = {};
 
   // ── Schemas ────────────────────────────────────────────────────────────────
   static final _defaultSchema = Schema.object({
@@ -55,6 +69,15 @@ class _ChatScreenState extends State<ChatScreen> {
     super.initState();
     ModelManager.instance.addListener(_onManagerUpdate);
     _inputCtrl.addListener(_updatePendingTokens);
+    _loadAllSkills();
+  }
+
+  Future<void> _loadAllSkills() async {
+    _allSkills = await buildDemoSkills();
+    for (final skill in _allSkills!) {
+      _skillToggles[skill.name] = true;
+    }
+    if (mounted) setState(() {});
   }
 
   @override
@@ -66,12 +89,27 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  void _onManagerUpdate() => setState(() {});
+  void _onManagerUpdate() {
+    if (ModelManager.instance.llmStatus == ModelStatus.ready && _chat == null && !_isGenerating && _operationLabel == null) {
+      _rebuildChatSafe();
+    } else {
+      setState(() {});
+    }
+  }
 
-  void _updatePendingTokens() {
-    final text = ((_inputCtrl.text.length / 4).ceil());
-    final imgs = _pendingImages.length * 257;
-    setState(() => _inputPendingTokens = text + imgs);
+  Future<void> _updatePendingTokens() async {
+    if (_chat != null) {
+      final est = await _chat!.estimateNextTurnTokens(
+        _inputCtrl.text,
+        images: _pendingImages.isEmpty ? null : _pendingImages,
+        audios: _pendingAudios.isEmpty ? null : _pendingAudios,
+      );
+      if (mounted) setState(() => _inputPendingTokens = est - _chat!.currentTokenCount);
+    } else {
+      final text = ((_inputCtrl.text.length / 4).ceil());
+      final imgs = _pendingImages.length * 257;
+      if (mounted) setState(() => _inputPendingTokens = text + imgs);
+    }
   }
 
   // ── Model loading ──────────────────────────────────────────────────────────
@@ -80,6 +118,7 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       await loadLlm(
         local: local,
+        enableMtp: _enableMtp,
         onProgress: (p) => setState(() => _loadProgress = p),
       );
       await _rebuildChat();
@@ -91,21 +130,86 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _unloadModel() async {
+    if (_isGenerating) {
+      _chat?.stop();
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
     await _chat?.dispose();
     _chat = null;
     await unloadLlm();
     setState(() {});
   }
 
+  Future<void> _rebuildChatSafe() async {
+    if (_isGenerating) {
+      _chat?.stop();
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    await _rebuildChat();
+  }
+
+  void _handleSkillResult(AgentToolCall call) {
+    try {
+      GemmaDebug.log(GemmaDebug.tagAgent, 'ChatScreen _handleSkillResult called for ${call.skillName}');
+      final decoded = jsonDecode(call.resultJson);
+      if (decoded is Map && decoded['image'] is Map && decoded['image']['base64'] != null) {
+        final b64 = decoded['image']['base64'] as String;
+        final cleanB64 = b64.contains(',') ? b64.split(',').last : b64;
+        final bytes = base64Decode(cleanB64);
+        
+        GemmaDebug.log(GemmaDebug.tagAgent, 'ChatScreen _handleSkillResult decoded image bytes: ${bytes.length}');
+        
+        setState(() {
+          _chat?.appendMessage(ChatMessage(
+            role: 'model',
+            text: '', // Empty text, just the image
+            images: [bytes],
+            isUiOnly: true, // Don't pollute the LLM context
+          ));
+        });
+        GemmaDebug.log(GemmaDebug.tagAgent, 'ChatScreen _handleSkillResult appended image message to history');
+      } else {
+        GemmaDebug.log(GemmaDebug.tagAgent, 'ChatScreen _handleSkillResult JSON did not contain image/base64');
+      }
+    } catch (e) {
+      GemmaDebug.logError(GemmaDebug.tagAgent, 'ChatScreen _handleSkillResult error', e);
+    }
+  }
+
   Future<void> _rebuildChat() async {
     setState(() => _operationLabel = 'Applying settings…');
     await _chat?.dispose();
     final mgr = ModelManager.instance;
-    _chat = GemmaChat(
-      maxContextTokens: mgr.maxTokens,
-      systemPrompt:     mgr.systemPrompt,
-      contextStrategy:  ContextStrategy.slidingWindow,
-    );
+    
+    if (_enableSkills) {
+      final skills = _allSkills?.where((s) => _skillToggles[s.name] ?? true).toList() ?? demoSkills;
+      _chat = AgentChat(
+        skills: skills,
+        maxLoops: _maxToolLoops,
+        onSkillResult: _handleSkillResult,
+        config: SessionConfig(
+          enableThinking: _enableThinking,
+          nativeToolCalling: _nativeToolCalling,
+          temperature: mgr.temperature,
+          topK: mgr.topK,
+          topP: mgr.topP,
+        ),
+      );
+    } else {
+      _chat = GemmaChat(
+        maxContextTokens: mgr.maxTokens,
+        systemPrompt:     mgr.systemPrompt,
+        contextStrategy:  ContextStrategy.slidingWindow,
+        config: SessionConfig(
+          enableThinking: _enableThinking,
+          enableMultimodality: _enableMultimodality,
+          temperature: mgr.temperature,
+          topK: mgr.topK,
+          topP: mgr.topP,
+        ),
+      );
+    }
+    
     await _chat!.init();
     _pendingImages.clear();
     _pendingAudios.clear();
@@ -125,7 +229,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     String payloadText = text;
     for (final pdf in _pendingPdfs) {
-      payloadText += '\n\n[📄 ${pdf['name']}]\n';
+      payloadText += '\n\n[ ${pdf['name']}]\n';
       for (final p in pdf['parts'] as List<ContentPart>) {
         if (p is TextPart)  payloadText += '${p.text}\n';
         if (p is ImagePart) allImages.add(p.bytes);
@@ -136,6 +240,7 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _isGenerating = true;
       _streamingBuffer = '';
+      _currentAgentTurn = null;
       _inputCtrl.clear();
       _pendingImages.clear();
       _pendingAudios.clear();
@@ -154,21 +259,45 @@ class _ChatScreenState extends State<ChatScreen> {
         } else {
           schema = _defaultSchema;
         }
-        final stream = _chat!.sendMessageJsonStream(
+        final stream = (_chat as GemmaChat).sendMessageJsonStream(
           text: payloadText, schema: schema, rawSchemaStr: raw,
           images: allImages.isEmpty ? null : allImages,
           audios: allAudios.isEmpty ? null : allAudios,
         );
         await for (final chunk in stream) {
           if (!mounted) break;
-          final pretty = (chunk is Map || chunk is List)
-              ? const JsonEncoder.withIndent('  ').convert(chunk)
-              : chunk.toString();
+          final pretty = chunk;
           setState(() => _streamingBuffer = pretty);
           _scrollToBottom();
         }
+      } else if (_chat is AgentChat) {
+        String lastRawText = '';
+        String lineBuffer = '';
+        final stream = (_chat as AgentChat).run(payloadText);
+        await for (final turn in stream) {
+          if (!mounted) break;
+          if (turn.rawText.length > lastRawText.length) {
+            final newText = turn.rawText.substring(lastRawText.length);
+            lastRawText = turn.rawText;
+            lineBuffer += newText;
+            while (lineBuffer.contains('\n')) {
+              final nlIndex = lineBuffer.indexOf('\n');
+              final line = lineBuffer.substring(0, nlIndex);
+              GemmaDebug.log(GemmaDebug.tagAgent, '[AgentRawOutput] $line');
+              lineBuffer = lineBuffer.substring(nlIndex + 1);
+            }
+          }
+          setState(() => _currentAgentTurn = turn);
+          _scrollToBottom();
+        }
+        if (lineBuffer.isNotEmpty) {
+          GemmaDebug.log(GemmaDebug.tagAgent, '[AgentRawOutput] $lineBuffer');
+        }
+        if (_currentAgentTurn != null) {
+          GemmaDebug.log(GemmaDebug.tagAgent, '[AgentRawOutput Full]\n${_currentAgentTurn!.rawText}');
+        }
       } else {
-        final stream = _chat!.sendMessageStream(
+        final stream = (_chat as GemmaChat).sendMessageStream(
           text: payloadText,
           images: allImages.isEmpty ? null : allImages,
           audios: allAudios.isEmpty ? null : allAudios,
@@ -183,7 +312,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!e.toString().contains('Stopped') && mounted) _snack('Error: $e');
     } finally {
       if (mounted) {
-        setState(() { _isGenerating = false; _streamingBuffer = ''; });
+        setState(() { _isGenerating = false; _streamingBuffer = ''; _currentAgentTurn = null; });
         ModelManager.instance.setGenerating(false);
       }
     }
@@ -211,11 +340,28 @@ class _ChatScreenState extends State<ChatScreen> {
       type: FileType.custom, allowedExtensions: ['pdf'], withData: true,
     );
     if (res == null) return;
+
+    final mode = await showDialog<PdfExtractionMode>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Extract PDF'),
+        content: const Text('How do you want to extract this PDF?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(context, PdfExtractionMode.textOnly), child: const Text('Text Only')),
+          TextButton(onPressed: () => Navigator.pop(context, PdfExtractionMode.imagesOnly), child: const Text('Images Only')),
+          FilledButton(onPressed: () => Navigator.pop(context, PdfExtractionMode.textAndImages), child: const Text('Text + Images')),
+        ],
+      ),
+    );
+    
+    if (mode == null) return;
+
     setState(() => _operationLabel = 'Extracting PDF…');
     try {
       final parts = await PdfProcessor.extract(
         res.files.first.bytes!,
-        const PdfExtractionConfig(mode: PdfExtractionMode.textAndImages),
+        PdfExtractionConfig(mode: mode),
       );
       _pendingPdfs.add({'name': res.files.first.name, 'parts': parts});
     } catch (e) {
@@ -299,9 +445,14 @@ class _ChatScreenState extends State<ChatScreen> {
     final cs     = Theme.of(context).colorScheme;
 
     // Build the display list including the in-progress streaming bubble.
-    final displayList = List<ChatMessage>.from(_chat?.history ?? []);
+    final historyList = _chat?.history ?? <ChatMessage>[];
+    final displayList = List<dynamic>.from(historyList.where((m) => !m.isHidden));
     if (_isGenerating) {
-      displayList.add(ChatMessage(role: 'model', text: _streamingBuffer.isEmpty ? '…' : _streamingBuffer));
+      if (_currentAgentTurn != null) {
+        displayList.add(_currentAgentTurn);
+      } else {
+        displayList.add(ChatMessage(role: 'model', text: _streamingBuffer.isEmpty ? '…' : _streamingBuffer));
+      }
     }
 
     return Scaffold(
@@ -313,7 +464,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ]),
         actions: [
           if (status == ModelStatus.ready || status == ModelStatus.generating)
-            IconButton(icon: const Icon(Icons.delete_sweep_outlined), tooltip: 'Clear context', onPressed: _isGenerating ? null : _rebuildChat),
+            IconButton(icon: const Icon(Icons.delete_sweep_outlined), tooltip: 'Clear context', onPressed: _isGenerating ? null : _rebuildChatSafe),
           Builder(builder: (c) => IconButton(icon: const Icon(Icons.settings_outlined), onPressed: () => Scaffold.of(c).openEndDrawer())),
         ],
       ),
@@ -359,12 +510,30 @@ class _ChatScreenState extends State<ChatScreen> {
                         padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
                         itemCount: displayList.length,
                         itemBuilder: (_, i) {
-                          final msg = displayList[i];
-                          final isLast = i == displayList.length - 1 && _isGenerating;
+                          final item = displayList[i];
+                          if (item is AgentTurn) return AgentTurnBubble(item);
+
+                          final msg = item as ChatMessage;
+                          
+                          // Check if this is an injected AgentTurn JSON message
+                          if (msg.role == 'model' && msg.isUiOnly) {
+                            try {
+                              final data = jsonDecode(msg.text);
+                              if (data is Map<String, dynamic> && data['is_agent_turn'] == true) {
+                                return AgentTurnBubble(AgentTurn.fromJson(data));
+                              }
+                            } catch (_) {
+                              // Fall back to normal message bubble if parsing fails
+                            }
+                          }
+
+                          final historyIndex = _chat?.history.indexOf(msg) ?? -1;
+                          final canEditOrDelete = !_isGenerating && historyIndex >= 0;
+
                           return MessageBubble(
                             msg,
-                            onEdit:   (!_isGenerating && i < (_chat?.history.length ?? 0)) ? () => _editMessage(i, msg) : null,
-                            onDelete: (!_isGenerating && i < (_chat?.history.length ?? 0)) ? () => _chat!.removeHistory(i).then((_) => setState(() {})) : null,
+                            onEdit:   canEditOrDelete ? () => _editMessage(historyIndex, msg) : null,
+                            onDelete: canEditOrDelete ? () => _chat!.removeHistory(historyIndex).then((_) => setState(() {})) : null,
                           );
                         },
                       ),
@@ -598,6 +767,28 @@ class _ChatScreenState extends State<ChatScreen> {
 
             // ── Session Config ─────────────────────────────────────────────
             const _SectionHeader('Session (apply without reload)'),
+            SwitchListTile(dense: true, title: const Text('Enable Thinking Mode'), value: _enableThinking, onChanged: (v) { setState(() => _enableThinking = v); mgr.updateSessionConfig(enableThinking: v); }),
+            SwitchListTile(dense: true, title: const Text('Enable Skills (Tools)'), subtitle: const Text('Disables multimodality natively'), value: _enableSkills, onChanged: (v) { setState(() => _enableSkills = v); mgr.updateSessionConfig(skills: v ? ['time_skill'] : []); }),
+            if (_enableSkills && _allSkills != null) ...[
+              const SizedBox(height: 8),
+              const Padding(
+                padding: EdgeInsets.only(left: 16, bottom: 4),
+                child: Text('Active Skills:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              ),
+              ..._allSkills!.map((skill) => SwitchListTile(
+                dense: true,
+                title: Text(skill.name, style: const TextStyle(fontSize: 13)),
+                subtitle: Text(skill.description, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)),
+                value: _skillToggles[skill.name] ?? true,
+                onChanged: (v) {
+                  setState(() => _skillToggles[skill.name] = v);
+                },
+              )),
+              const SizedBox(height: 8),
+            ],
+            SwitchListTile(dense: true, title: const Text('Native Tool Calling'), subtitle: const Text('If on Android, use native bridge'), value: _nativeToolCalling, onChanged: (v) { setState(() => _nativeToolCalling = v); }),
+            if (_enableSkills) _SliderTile(label: 'Max Tool Loops', value: _maxToolLoops.toDouble(), min: 1, max: 20, divisions: 19, onChanged: (v) => setState(() => _maxToolLoops = v.toInt())),
+            SwitchListTile(dense: true, title: const Text('Enable Multimodality'), subtitle: const Text('Allow Image/Audio processing'), value: _enableMultimodality, onChanged: (v) { setState(() => _enableMultimodality = v); mgr.updateSessionConfig(enableMultimodality: v); }),
             _SliderTile(label: 'Temperature', value: mgr.temperature, min: 0, max: 2, divisions: 40, onChanged: (v) => mgr.updateSessionConfig(temperature: v)),
             _SliderTile(label: 'Top-P', value: mgr.topP, min: 0, max: 1, divisions: 20, onChanged: (v) => mgr.updateSessionConfig(topP: v)),
             _SliderTile(label: 'Top-K', value: mgr.topK.toDouble(), min: 1, max: 100, divisions: 99, onChanged: (v) => mgr.updateSessionConfig(topK: v.toInt())),
@@ -612,7 +803,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             const SizedBox(height: 8),
             FilledButton.tonalIcon(
-              onPressed: _chat != null ? () { Navigator.pop(context); _rebuildChat(); } : null,
+              onPressed: _chat != null ? () { Navigator.pop(context); _rebuildChatSafe(); } : null,
               icon: const Icon(Icons.refresh, size: 18),
               label: const Text('Rebuild Session'),
             ),
@@ -623,10 +814,17 @@ class _ChatScreenState extends State<ChatScreen> {
             _SliderTile(
               label: 'Max Tokens: ${mgr.maxTokens}',
               value: mgr.maxTokens.toDouble(), min: 1024, max: 8192, divisions: 7,
-              onChanged: (v) { mgr.maxTokens = v.toInt(); mgr.notifyListeners(); },
+              onChanged: (v) { mgr.maxTokens = v.toInt(); mgr.update(); },
             ),
-            SwitchListTile(dense: true, title: const Text('Use GPU'), value: mgr.useGpu, onChanged: (v) { mgr.useGpu = v; mgr.notifyListeners(); }),
-            SwitchListTile(dense: true, title: const Text('Audio support'), value: mgr.supportAudio, onChanged: (v) { mgr.supportAudio = v; mgr.notifyListeners(); }),
+            SwitchListTile(dense: true, title: const Text('Use GPU'), value: mgr.useGpu, onChanged: (v) { mgr.useGpu = v; mgr.update(); }),
+            SwitchListTile(dense: true, title: const Text('Enable MTP (Gemma 4)'), subtitle: const Text('Speculative decoding (Android only)'), value: _enableMtp, onChanged: (v) { setState(() => _enableMtp = v); }),
+            SwitchListTile(dense: true, title: const Text('Audio support'), value: mgr.supportAudio, onChanged: (v) { mgr.supportAudio = v; mgr.update(); }),
+            const SizedBox(height: 8),
+            FilledButton.tonalIcon(
+              onPressed: () { Navigator.pop(context); _loadModel(local: true); },
+              icon: const Icon(Icons.power_settings_new, size: 18),
+              label: const Text('Reload Engine'),
+            ),
             const Divider(height: 24),
 
             // ── History ────────────────────────────────────────────────────

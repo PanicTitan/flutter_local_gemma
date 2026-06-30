@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Wikipedia Skill</title>
+</head>
+<body>
+  <script>
+    async function ai_edge_gallery_get_result(data, secret) {
+      const args = JSON.parse(data);
+      const query = args.query;
+      try {
+        const res = await fetch(`https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro&explaintext&format=json&origin=*&titles=${encodeURIComponent(query)}`);
+        const json = await res.json();
+        const pages = json.query.pages;
+        const pageId = Object.keys(pages)[0];
+        if (pageId === "-1") {
+          return JSON.stringify({ result: "Topic not found on Wikipedia." });
+        }
+        return JSON.stringify({ result: pages[pageId].extract });
+      } catch (e) {
+        return JSON.stringify({ error: e.toString() });
+      }
+    }
+  </script>
+</body>
+</html>

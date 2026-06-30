@@ -53,6 +53,14 @@ flutter:
     - test/test.png
     - test/test.wav
     - test/test.pdf
+    - assets/skills/calculator/SKILL.md
+    - assets/skills/calculator/scripts/index.html
+    - assets/skills/qr-code/SKILL.md
+    - assets/skills/qr-code/scripts/index.html
+    - assets/skills/query-wikipedia/SKILL.md
+    - assets/skills/query-wikipedia/scripts/index.html
+    - assets/skills/test-secret/SKILL.md
+    - assets/skills/test-secret/scripts/index.html
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

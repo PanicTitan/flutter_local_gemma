@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_gemma/flutter_local_gemma.dart';
@@ -138,39 +137,45 @@ class _BenchmarkScreenState extends State<BenchmarkScreen> {
   }
 
   /// Quick single inference benchmark (assumes model already loaded).
-  Future<void> _runInferenceOnly() async {
+  Future<void> _runMtpSuite() async {
     _runner.clear();
     _lastResponse = null;
     setState(() => _isRunning = true);
 
     final mgr = ModelManager.instance;
-    if (mgr.llmStatus != ModelStatus.ready) {
-      _snack('Load the model first via the Chat tab or the full suite.');
-      setState(() => _isRunning = false);
-      return;
-    }
-
     try {
       final prompt = _promptCtrl.text.trim();
-      final chat   = SingleTurnChat(config: mgr.sessionConfig);
-
-      for (int i = 1; i <= 3; i++) {
-        final reply = await _runner.measure(
-          'Inference run #$i',
-          () => chat.generate(prompt),
-          detailFn: (r) => '${r.split(' ').length} words',
-        );
-        _lastResponse = reply;
-      }
+      
+      // Load without MTP
+      mgr.setLlmStatus(ModelStatus.loading);
+      await _runner.measure('Model load (MTP OFF)', () async {
+        await FlutterLocalGemma().init(InferenceConfig(modelPath: 'gemma-4-E2B-it.litertlm', maxTokens: mgr.maxTokens, enableMtp: false));
+      });
+      mgr.setLlmStatus(ModelStatus.ready);
+      final chatOff = SingleTurnChat(config: mgr.sessionConfig);
+      await _runner.measure('Inference (MTP OFF)', () => chatOff.generate(prompt), detailFn: (r) => '${r.split(' ').length} words');
+      
+      await FlutterLocalGemma().dispose();
+      
+      // Load with MTP
+      mgr.setLlmStatus(ModelStatus.loading);
+      await _runner.measure('Model load (MTP ON)', () async {
+        await FlutterLocalGemma().init(InferenceConfig(modelPath: 'gemma-4-E2B-it.litertlm', maxTokens: mgr.maxTokens, enableMtp: true));
+      });
+      mgr.setLlmStatus(ModelStatus.ready);
+      final chatOn = SingleTurnChat(config: mgr.sessionConfig);
+      await _runner.measure('Inference (MTP ON)', () => chatOn.generate(prompt), detailFn: (r) => '${r.split(' ').length} words');
 
       _runner.printSummary();
-      _snack('Done – 3 runs completed.');
+      _snack('MTP Benchmark complete!');
     } catch (e) {
       _snack('Error: $e');
     } finally {
       setState(() => _isRunning = false);
     }
   }
+
+
 
   void _snack(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
 
@@ -209,13 +214,19 @@ class _BenchmarkScreenState extends State<BenchmarkScreen> {
               Expanded(child: FilledButton.icon(
                 onPressed: _isRunning ? null : _runFullSuite,
                 icon: const Icon(Icons.play_arrow, size: 18),
-                label: const Text('Full Suite'),
+                label: const Text('Suite A/B'),
               )),
               const SizedBox(width: 8),
               Expanded(child: FilledButton.icon(
-                onPressed: _isRunning ? null : _runInferenceOnly,
+                onPressed: _isRunning ? null : _runMtpSuite,
                 icon: const Icon(Icons.speed, size: 18),
-                label: const Text('Inference ×3'),
+                label: const Text('MTP Suite'),
+              )),
+              const SizedBox(width: 8),
+              Expanded(child: FilledButton.icon(
+                onPressed: _isRunning ? null : () {},
+                icon: const Icon(Icons.psychology, size: 18),
+                label: const Text('Suite D/E (Agents)'),
               )),
               const SizedBox(width: 8),
               OutlinedButton(

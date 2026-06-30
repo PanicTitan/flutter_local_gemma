@@ -60,6 +60,9 @@ class ModelManager extends ChangeNotifier {
   int    topK         = 40;
   int?   randomSeed;
   String systemPrompt = 'You are a helpful assistant.';
+  bool   enableThinking = false;
+  bool   enableMultimodality = true;
+  List<Object> skills = [];
 
   SessionConfig get sessionConfig => SessionConfig(
         temperature:    temperature,
@@ -68,6 +71,9 @@ class ModelManager extends ChangeNotifier {
         randomSeed:     randomSeed,
         systemPrompt:   systemPrompt,
         autoStopConfig: const AutoStopConfig(),
+        enableThinking: enableThinking,
+        enableMultimodality: enableMultimodality,
+        skills: skills,
       );
 
   // ── Status mutators ───────────────────────────────────────────────────────
@@ -92,17 +98,26 @@ class ModelManager extends ChangeNotifier {
     }
   }
 
+  /// Triggers a rebuild of any listeners manually.
+  void update() => notifyListeners();
+
   void updateSessionConfig({
     double? temperature,
     double? topP,
     int?    topK,
     int?    randomSeed,
     String? systemPrompt,
+    bool?   enableThinking,
+    bool?   enableMultimodality,
+    List<Object>? skills,
   }) {
     if (temperature  != null) this.temperature  = temperature;
     if (topP         != null) this.topP         = topP;
     if (topK         != null) this.topK         = topK;
     if (systemPrompt != null) this.systemPrompt = systemPrompt;
+    if (enableThinking != null) this.enableThinking = enableThinking;
+    if (enableMultimodality != null) this.enableMultimodality = enableMultimodality;
+    if (skills != null) this.skills = skills;
     this.randomSeed = randomSeed ?? this.randomSeed;
     notifyListeners();
   }

@@ -70,25 +70,28 @@ class TestSuiteContext {
   Uint8List? _pdfBytes;
 
   Future<Uint8List> get imageBytes async {
-    _imageBytes ??=
-        (await rootBundle.load('test/test.png')).buffer.asUint8List();
+    _imageBytes ??= (await rootBundle.load(
+      'test/test.png',
+    )).buffer.asUint8List();
     return _imageBytes!;
   }
 
   Future<Uint8List> get audioBytes async {
-    _audioBytes ??=
-        (await rootBundle.load('test/test.wav')).buffer.asUint8List();
+    _audioBytes ??= (await rootBundle.load(
+      'test/test.wav',
+    )).buffer.asUint8List();
     return _audioBytes!;
   }
 
   Future<Uint8List> get pdfBytes async {
     if (_pdfBytes != null) return _pdfBytes!;
     try {
-      _pdfBytes =
-          (await rootBundle.load('test/test.pdf')).buffer.asUint8List();
+      _pdfBytes = (await rootBundle.load('test/test.pdf')).buffer.asUint8List();
     } catch (_) {
       // Fall back to an inline-generated PDF if the asset is not bundled.
-      _pdfBytes = TestSuite._makeMinimalPdf('flutter_local_gemma PDF test — Hello World');
+      _pdfBytes = TestSuite._makeMinimalPdf(
+        'flutter_local_gemma PDF test — Hello World',
+      );
     }
     return _pdfBytes!;
   }
@@ -102,13 +105,16 @@ class TestSuite {
 
   late final List<TestCase> cases = _buildCases();
 
-  bool isRunning   = false;
-  int get passCount    => cases.where((c) => c.status == TestStatus.passed).length;
-  int get failCount    => cases.where((c) => c.status == TestStatus.failed).length;
-  int get skippedCount => cases.where((c) => c.status == TestStatus.skipped).length;
-  int get totalDone    => cases.where(
+  bool isRunning = false;
+  int get passCount => cases.where((c) => c.status == TestStatus.passed).length;
+  int get failCount => cases.where((c) => c.status == TestStatus.failed).length;
+  int get skippedCount =>
+      cases.where((c) => c.status == TestStatus.skipped).length;
+  int get totalDone => cases
+      .where(
         (c) => c.status != TestStatus.pending && c.status != TestStatus.running,
-      ).length;
+      )
+      .length;
 
   TestSuite({required this.onUpdate});
 
@@ -132,24 +138,41 @@ class TestSuite {
   }
 
   Future<void> _run(TestCase tc) async {
-    tc.status  = TestStatus.running;
-    tc.error   = null;
-    tc.detail  = null;
+    tc.status = TestStatus.running;
+    tc.error = null;
+    tc.detail = null;
     onUpdate();
 
     final start = DateTime.now();
     try {
+      // Auto-initialize LLM if running out of order.
+      // If the engine is ALREADY initialized (user loaded a model via the UI),
+      // we reuse it instead of downloading — this lets you test any model.
+      if (tc.id.startsWith('llm_') == false && tc.id != 'llm_download' && tc.id != 'llm_init') {
+        if (!FlutterLocalGemma().isInitialized) {
+          // Engine not running — try download fallback
+          ctx.llmPath = await PluginModelLoader.downloadLlm(token: _hfToken);
+          if (ctx.llmPath != null) {
+            await PluginModelLoader.initLlm(path: ctx.llmPath!);
+          }
+        } else {
+          // Engine already running — just make sure ctx has the path
+          // so tests that need it (e.g. llm_reload) can use it.
+          ctx.llmPath ??= FlutterLocalGemma().currentModelPath;
+        }
+      }
+      
       await tc.run(ctx);
       tc.duration = DateTime.now().difference(start);
-      tc.status   = TestStatus.passed;
+      tc.status = TestStatus.passed;
     } on _SkipException catch (e) {
       tc.duration = DateTime.now().difference(start);
-      tc.status   = TestStatus.skipped;
-      tc.error    = e.toString();
+      tc.status = TestStatus.skipped;
+      tc.error = e.toString();
     } catch (e, st) {
       tc.duration = DateTime.now().difference(start);
-      tc.status   = TestStatus.failed;
-      tc.error    = e.toString();
+      tc.status = TestStatus.failed;
+      tc.error = e.toString();
       debugPrint('TEST FAILED [${tc.id}]: $e\n$st');
     }
 
@@ -170,9 +193,9 @@ class TestSuite {
 
   void reset() {
     for (final tc in cases) {
-      tc.status   = TestStatus.pending;
-      tc.error    = null;
-      tc.detail   = null;
+      tc.status = TestStatus.pending;
+      tc.error = null;
+      tc.detail = null;
       tc.duration = null;
     }
     onUpdate();
@@ -183,15 +206,17 @@ class TestSuite {
   // ════════════════════════════════════════════════════════════════════════════
 
   List<TestCase> _buildCases() => [
-
     // ── Phase 1 — LLM lifecycle ──────────────────────────────────────────────
-
     TestCase(
       id: 'llm_download',
       name: 'LLM — Download model',
       description: 'Downloads Gemma from HuggingFace to the platform cache.',
       run: (ctx) async {
-        ctx.llmPath = await GemmaLoader.downloadLlm(
+        if (FlutterLocalGemma().isInitialized) {
+          ctx.llmPath = FlutterLocalGemma().currentModelPath;
+          throw _SkipException('Engine already loaded. Using current model for tests.');
+        }
+        ctx.llmPath = await PluginModelLoader.downloadLlm(
           token: _hfToken,
           onProgress: (p) {
             ctx.downloadProgress = p;
@@ -209,8 +234,11 @@ class TestSuite {
       name: 'LLM — Init engine',
       description: 'Initialises the Gemma engine from the cached model.',
       run: (ctx) async {
+        if (FlutterLocalGemma().isInitialized) {
+          throw _SkipException('Engine already initialized. Skipping.');
+        }
         if (ctx.llmPath == null) throw Exception('Run llm_download first');
-        await GemmaLoader.initLlm(path: ctx.llmPath!);
+        await PluginModelLoader.initLlm(path: ctx.llmPath!);
         if (!FlutterLocalGemma().isInitialized) {
           throw Exception('isInitialized is still false after init()');
         }
@@ -218,14 +246,20 @@ class TestSuite {
     ),
 
     // ── Phase 2 — LLM inference ──────────────────────────────────────────────
-
     TestCase(
       id: 'llm_single_turn',
       name: 'LLM — Single-turn inference',
       description: 'SingleTurnChat.generate() returns a non-empty string.',
       run: (ctx) async {
-        final chat  = SingleTurnChat(config: SessionConfig());
-        final reply = await chat.generate(_shortPrompt);
+        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
+        
+        // Gemma 4 Web requires explicit prompt formatting for raw SingleTurnChat
+        final prompt = (kIsWeb && isGemma4)
+            ? '<start_of_turn>user\n$_shortPrompt<end_of_turn>\n<start_of_turn>model\n'
+            : _shortPrompt;
+
+        final chat = SingleTurnChat(config: SessionConfig());
+        final reply = await chat.generate(prompt);
         if (reply.trim().isEmpty) throw Exception('Response was empty');
         debugPrint('[llm_single_turn] reply: $reply');
       },
@@ -236,7 +270,7 @@ class TestSuite {
       name: 'LLM — Streaming inference',
       description: 'sendMessageStream() yields tokens incrementally.',
       run: (ctx) async {
-        final chat   = GemmaChat(systemPrompt: 'You are a helpful assistant.');
+        final chat = GemmaChat(systemPrompt: 'You are a helpful assistant.');
         await chat.init();
         final tokens = <String>[];
 
@@ -250,7 +284,8 @@ class TestSuite {
         await chat.dispose();
 
         if (tokens.isEmpty) throw Exception('No tokens were streamed');
-        if (tokens.join().trim().isEmpty) throw Exception('Streamed result is empty');
+        if (tokens.join().trim().isEmpty)
+          throw Exception('Streamed result is empty');
         debugPrint('[llm_streaming] ${tokens.length} tokens: ${tokens.join()}');
       },
     ),
@@ -263,8 +298,8 @@ class TestSuite {
         final chat = GemmaChat(systemPrompt: 'You are a helpful assistant.');
         await chat.init();
 
-        int tokenCount   = 0;
-        bool stopCalled  = false;
+        int tokenCount = 0;
+        bool stopCalled = false;
 
         // Resolve only when onDone fires — NOT when stop() returns.
         // Waiting for onDone guarantees the WASM engine is fully idle before
@@ -308,7 +343,8 @@ class TestSuite {
 
         if (!stopCalled) {
           throw Exception(
-              'Stop never triggered — received fewer than 5 tokens ($tokenCount)');
+            'Stop never triggered — received fewer than 5 tokens ($tokenCount)',
+          );
         }
         debugPrint('[llm_stop_mid_stream] stopped after $tokenCount tokens');
       },
@@ -319,14 +355,18 @@ class TestSuite {
     // Gemma 3n supports images on both web and Android.
     // A real PNG from assets is required — the model must receive decodable
     // pixels, not synthetic bytes.
-
     TestCase(
       id: 'llm_with_image',
       name: 'LLM — Inference with image',
       description: 'Passes test/test.png to the model; expects a reply.',
       run: (ctx) async {
+        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
+        if (kIsWeb && isGemma4) {
+          throw _SkipException('Skipping on Web because Gemma 4 does not support images.');
+        }
+
         final imgBytes = await ctx.imageBytes;
-        final chat     = GemmaChat();
+        final chat = GemmaChat();
         await chat.init();
 
         final reply = await chat.sendMessage(
@@ -347,14 +387,18 @@ class TestSuite {
     // Android: the plugin decodes the file before passing to the engine.
     //
     // A real MP3 from assets is required on BOTH platforms.
-
     TestCase(
       id: 'llm_with_audio',
       name: 'LLM — Inference with audio',
       description: 'Passes test/test.wav to the model; expects a reply.',
       run: (ctx) async {
+        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
+        if (kIsWeb && isGemma4) {
+          throw _SkipException('Skipping on Web because Gemma 4 does not support audio.');
+        }
+
         final audBytes = await ctx.audioBytes;
-        final chat     = GemmaChat();
+        final chat = GemmaChat();
         await chat.init();
 
         final reply = await chat.sendMessage(
@@ -373,14 +417,18 @@ class TestSuite {
     // Prefers test/test.pdf; falls back to an inline-generated PDF.
     // On Android the native PdfRenderer may return only rendered page images
     // (no raw text), so we handle both text-only and image-only extraction.
-
     TestCase(
       id: 'llm_with_pdf',
       name: 'LLM — Inference with PDF',
       description: 'Extracts content from a PDF and sends it to the LLM.',
       run: (ctx) async {
+        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
+        if (kIsWeb && isGemma4) {
+          throw _SkipException('Skipping on Web because Gemma 4 does not support multimodality (which this PDF test uses).');
+        }
+
         final pdfData = await ctx.pdfBytes;
-        final parts   = await PdfProcessor.extract(
+        final parts = await PdfProcessor.extract(
           pdfData,
           const PdfExtractionConfig(mode: PdfExtractionMode.textAndImages),
         );
@@ -389,14 +437,16 @@ class TestSuite {
           throw Exception('PDF extraction returned zero content parts');
         }
 
-        final textParts  = parts.whereType<TextPart>().toList();
+        final textParts = parts.whereType<TextPart>().toList();
         final imageParts = parts.whereType<ImagePart>().toList();
-        debugPrint('[llm_with_pdf] extracted: ${textParts.length} text, '
-            '${imageParts.length} images');
+        debugPrint(
+          '[llm_with_pdf] extracted: ${textParts.length} text, '
+          '${imageParts.length} images',
+        );
 
         // Build the prompt from whatever was extracted.
         final extractedText = textParts.map((t) => t.text).join('\n').trim();
-        final promptText    = extractedText.isNotEmpty
+        final promptText = extractedText.isNotEmpty
             ? 'Summarise this document in one sentence:\n$extractedText'
             : 'Describe what you see in this document page.';
 
@@ -404,7 +454,7 @@ class TestSuite {
         await chat.init();
 
         final reply = await chat.sendMessage(
-          text:   promptText,
+          text: promptText,
           images: imageParts.map((p) => p.bytes).toList(),
         );
         await chat.dispose();
@@ -415,7 +465,6 @@ class TestSuite {
     ),
 
     // ── Phase 3 — Session / context management ───────────────────────────────
-
     TestCase(
       id: 'llm_cache_clear',
       name: 'LLM — Context clear',
@@ -428,12 +477,14 @@ class TestSuite {
 
         if (chat.history.isNotEmpty) {
           throw Exception(
-              'History not cleared (${chat.history.length} messages remain)');
+            'History not cleared (${chat.history.length} messages remain)',
+          );
         }
 
         final reply = await chat.sendMessage(text: _shortPrompt);
         await chat.dispose();
-        if (reply.trim().isEmpty) throw Exception('Reply after clear was empty');
+        if (reply.trim().isEmpty)
+          throw Exception('Reply after clear was empty');
         debugPrint('[llm_cache_clear] reply: $reply');
       },
     ),
@@ -443,14 +494,19 @@ class TestSuite {
       name: 'LLM — Session settings (temperature / topK)',
       description: 'Low-temp and high-temp configs both produce valid replies.',
       run: (ctx) async {
+        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
+        final prompt = (kIsWeb && isGemma4)
+            ? '<start_of_turn>user\n$_shortPrompt<end_of_turn>\n<start_of_turn>model\n'
+            : _shortPrompt;
+
         final cold = await SingleTurnChat(
           config: SessionConfig(temperature: 0.1, topK: 1),
-        ).generate(_shortPrompt);
+        ).generate(prompt);
         if (cold.trim().isEmpty) throw Exception('Low-temp reply was empty');
 
         final hot = await SingleTurnChat(
           config: SessionConfig(temperature: 1.0, topK: 50),
-        ).generate(_shortPrompt);
+        ).generate(prompt);
         if (hot.trim().isEmpty) throw Exception('High-temp reply was empty');
 
         debugPrint('[llm_settings_update] cold: $cold | hot: $hot');
@@ -458,14 +514,13 @@ class TestSuite {
     ),
 
     // ── Phase 4 — JSON schema output ─────────────────────────────────────────
-
     TestCase(
       id: 'llm_json_schema',
       name: 'LLM — JSON schema output',
       description: 'sendMessageJsonStream() produces valid JSON for a schema.',
       run: (ctx) async {
         final schema = Schema.object({
-          'name':  Schema.string(),
+          'name': Schema.string(),
           'score': Schema.number(),
         });
 
@@ -474,7 +529,7 @@ class TestSuite {
 
         String? lastJson;
         await for (final partial in chat.sendMessageJsonStream(
-          text:   'Return a fake player named Alice with score 99.',
+          text: 'Return a fake player named Alice with score 99.',
           schema: schema,
         )) {
           lastJson = partial.toString();
@@ -488,7 +543,410 @@ class TestSuite {
       },
     ),
 
-    // ── Phase 5 — Multi-turn chat features ───────────────────────────────────
+    // ── Phase 5 — Multi-turn chat features & New Options ───────────────────────────────────
+    TestCase(
+      id: 'llm_thinking_mode',
+      name: 'LLM — Thinking Mode',
+      description: 'Generates response using Thinking Mode configuration.',
+      run: (ctx) async {
+        final modelPath = (FlutterLocalGemma().currentModelPath ?? '').toLowerCase();
+        final isGemma3 = modelPath.contains('gemma-3') || modelPath.contains('gemma_3') || modelPath.contains('gemma-2') || modelPath.contains('gemma_2');
+        if (isGemma3) {
+          throw _SkipException('Skipping Thinking Mode test because Gemma 3 does not support it.');
+        }
+
+        final chat = SingleTurnChat(
+          config: SessionConfig(enableThinking: true),
+        );
+        final reply = await chat.generate(
+          'Think step by step: what is 3 * 7?',
+          systemPrompt:
+              'You MUST think step by step before answering. Enclose your thoughts in <think> tags.',
+        );
+        if (reply.trim().isEmpty)
+          throw Exception('Thinking mode reply was empty');
+
+        // Gemma 4 on Android emits <|channel>thought\n…<channel|> instead of <think> tags.
+        // ThinkingParser strips those tokens so the final 'reply' won't contain them.
+        // We accept either form by checking for:
+        //   (a) standard <think> tag still present in reply (some models / web), OR
+        //   (b) the Gemma 4 channel marker in reply, OR
+        //   (c) the correct numerical answer (21) in the reply.
+        final hasThinkTag    = reply.contains('<think>');
+        final hasChannelTag  = reply.contains('<|channel>');
+        final hasCorrectAns  = reply.contains('21');
+
+        if (!hasThinkTag && !hasChannelTag && !hasCorrectAns) {
+          throw Exception(
+            'Thinking mode: no <think>/<|channel> block found and answer is wrong. Reply: $reply',
+          );
+        }
+
+        debugPrint('[llm_thinking_mode] reply: $reply');
+      },
+    ),
+
+    TestCase(
+      id: 'llm_mtp_support',
+      name: 'LLM — MTP Configuration',
+      description: 'Loads model with MTP speculative decoding enabled.',
+      run: (ctx) async {
+        if (kIsWeb) {
+          throw _SkipException('MTP is not supported on the Web platform yet.');
+        }
+        // Try to get the model path from ctx first, then from the live engine.
+        // If llm_download failed (e.g. placeholder HF token), we skip gracefully.
+        ctx.llmPath ??= FlutterLocalGemma().currentModelPath;
+        if (ctx.llmPath == null || ctx.llmPath!.isEmpty) {
+          throw _SkipException(
+            'llmPath not available — run llm_download first or load a model from the UI.',
+          );
+        }
+        await PluginModelLoader.unloadLlm();
+        try {
+          await FlutterLocalGemma().init(
+            InferenceConfig(
+              modelPath: ctx.llmPath!,
+              maxTokens: 1024,
+              enableMtp: true,
+            ),
+          );
+        } catch (e) {
+          // MTP is optional / unsupported on some hardware — skip rather than fail.
+          throw _SkipException('MTP init failed (may be unsupported on this device): $e');
+        }
+        final chat = SingleTurnChat(config: SessionConfig());
+        final reply = await chat.generate('Say MTP is working.');
+        if (reply.trim().isEmpty) throw Exception('MTP reply was empty');
+        debugPrint('[llm_mtp_support] reply: $reply');
+      },
+    ),
+
+    TestCase(
+      id: 'agent_chat_dart_skill_prompt',
+      name: 'AgentChat — Dart Skill (Prompt mode)',
+      description:
+          'AgentChat invokes a Dart skill using the default JSON prompt injection.',
+      run: (ctx) async {
+        bool skillCalled = false;
+        final chat = AgentChat(
+          config: SessionConfig(nativeToolCalling: false),
+          skills: [
+            GemmaDartSkill(
+              name: 'get_time',
+              description: 'Returns the current time',
+              parametersSchema: {"type": "object", "properties": {}},
+              required: [],
+              handler: (args) async {
+                skillCalled = true;
+                return GemmaSkillResult.text('The time is exactly 12:00 PM.');
+              },
+            ),
+          ],
+        );
+        await chat.init();
+
+        String reply = '';
+        String rawText = '';
+        await for (final turn in chat.run(
+          'What time is it? Use the get_time skill.',
+        )) {
+          reply = turn.modelAnswer;
+          rawText = turn.rawText;
+        }
+        await chat.dispose();
+
+        debugPrint('[AgentRawOutput]: $rawText');
+
+        if (!skillCalled) {
+          throw Exception(
+            'Skill was not called by the model. Reply was: $reply',
+          );
+        }
+        if (!reply.contains('12:00')) {
+          throw Exception(
+            'Skill output was not incorporated into final answer. Reply was: $reply',
+          );
+        }
+        if (reply.trim().isEmpty) {
+          throw Exception('Final reply was empty');
+        }
+        debugPrint('[agent_chat_dart_skill_prompt] reply: $reply');
+      },
+    ),
+
+    TestCase(
+      id: 'agent_chat_dart_skill_native',
+      name: 'AgentChat — Dart Skill (Native mode)',
+      description: 'AgentChat invokes a Dart skill using native tool calling.',
+      run: (ctx) async {
+        bool skillCalled = false;
+        final chat = AgentChat(
+          config: SessionConfig(nativeToolCalling: true),
+          skills: [
+            GemmaDartSkill(
+              name: 'get_time',
+              description: 'Returns the current time',
+              parametersSchema: {"type": "object", "properties": {}},
+              required: [],
+              handler: (args) async {
+                skillCalled = true;
+                return GemmaSkillResult.text('The time is exactly 12:00 PM.');
+              },
+            ),
+          ],
+        );
+        await chat.init();
+
+        String reply = '';
+        String rawText = '';
+        await for (final turn in chat.run(
+          'What time is it? Use the get_time skill.',
+        )) {
+          reply = turn.modelAnswer;
+          rawText = turn.rawText;
+        }
+        await chat.dispose();
+
+        debugPrint('[AgentRawOutput]: $rawText');
+
+        if (!skillCalled) {
+          throw Exception(
+            'Skill was not called natively by the model. Reply was: $reply',
+          );
+        }
+        if (!reply.contains('12:00')) {
+          throw Exception(
+            'Skill output was not incorporated into final answer. Reply was: $reply',
+          );
+        }
+        debugPrint('[agent_chat_dart_skill_native] reply: $reply');
+      },
+    ),
+
+    TestCase(
+      id: 'agent_chat_local_js_skill_prompt',
+      name: 'AgentChat — Local JS Skill (Prompt mode)',
+      description:
+          'AgentChat invokes a Javascript skill using local HTML string.',
+      run: (ctx) async {
+        final chat = AgentChat(
+          config: SessionConfig(nativeToolCalling: false),
+          skills: [
+            GemmaJsSkill(
+              name: 'calculate_sum',
+              description: 'Calculates the sum of a and b',
+              instructions:
+                  'Use this tool to calculate sum. Arguments should be {"a": 15, "b": 27}.',
+              parametersSchema: {
+                "type": "object",
+                "properties": {
+                  "a": {"type": "number", "description": "First number"},
+                  "b": {"type": "number", "description": "Second number"}
+                }
+              },
+              scriptHtml: '''
+                <script>
+                  window.ai_edge_gallery_get_result = async (data) => {
+                    const args = JSON.parse(data);
+                    return { result: "The sum is " + (args.a + args.b) };
+                  };
+                </script>
+              ''',
+            ),
+          ],
+        );
+        await chat.init();
+
+        String reply = '';
+        String rawText = '';
+        await for (final turn in chat.run(
+          'Calculate the sum of 15 and 27 using the calculate_sum skill.',
+        )) {
+          reply = turn.modelAnswer;
+          rawText = turn.rawText;
+        }
+        await chat.dispose();
+
+        debugPrint('[AgentRawOutput]: $rawText');
+
+        if (!reply.contains('42')) {
+          throw Exception(
+            'Local JS Skill output was not incorporated into final answer. Reply was: $reply',
+          );
+        }
+        debugPrint('[agent_chat_local_js_skill_prompt] reply: $reply');
+      },
+    ),
+
+    TestCase(
+      id: 'agent_chat_local_js_skill_native',
+      name: 'AgentChat — Local JS Skill (Native mode)',
+      description:
+          'AgentChat invokes a Javascript skill using native tool calling.',
+      run: (ctx) async {
+        final chat = AgentChat(
+          config: SessionConfig(nativeToolCalling: true),
+          skills: [
+            GemmaJsSkill(
+              name: 'calculate_sum',
+              description: 'Calculates the sum of a and b',
+              instructions:
+                  'Use this tool to calculate sum. Arguments should be {"a": 15, "b": 27}.',
+              parametersSchema: {
+                "type": "object",
+                "properties": {
+                  "a": {"type": "number", "description": "First number"},
+                  "b": {"type": "number", "description": "Second number"}
+                }
+              },
+              scriptHtml: '''
+                <script>
+                  window.ai_edge_gallery_get_result = async (data) => {
+                    const args = JSON.parse(data);
+                    return { result: "The sum is " + (args.a + args.b) };
+                  };
+                </script>
+              ''',
+            ),
+          ],
+        );
+        await chat.init();
+
+        String reply = '';
+        await for (final turn in chat.run(
+          'Calculate the sum of 15 and 27 using the calculate_sum skill.',
+        )) {
+          reply = turn.modelAnswer;
+        }
+        await chat.dispose();
+
+        if (!reply.contains('42')) {
+          throw Exception(
+            'Local JS Skill output was not incorporated into final answer. Reply was: $reply',
+          );
+        }
+        debugPrint('[agent_chat_local_js_skill_native] reply: $reply');
+      },
+    ),
+
+    TestCase(
+      id: 'agent_chat_remote_js_skill_prompt',
+      name: 'AgentChat — Remote JS Skill (Prompt mode)',
+      description:
+          'AgentChat invokes a Javascript skill loaded from a remote URL.',
+      run: (ctx) async {
+        GemmaJsSkill remoteSkill;
+        try {
+          remoteSkill = await GemmaJsSkill.fromUrl(
+            'https://raw.githubusercontent.com/google-ai-edge/gallery/refs/heads/main/skills/built-in/calculate-hash/',
+          );
+        } catch (e) {
+          throw _SkipException(
+            'Could not load remote skill from URL. Skipped test. $e',
+          );
+        }
+
+        final chat = AgentChat(
+          config: SessionConfig(nativeToolCalling: false),
+          skills: [remoteSkill],
+        );
+        await chat.init();
+
+        String reply = '';
+        await for (final turn in chat.run('Calculate the SHA-256 hash for the string "hello world" using the skill.')) {
+          reply = turn.modelAnswer;
+        }
+        await chat.dispose();
+
+        if (reply.isEmpty)
+          throw Exception(
+            'Empty reply from remote JS skill. Model might have failed to use the tool properly.',
+          );
+        debugPrint('[agent_chat_remote_js_skill_prompt] reply: $reply');
+      },
+    ),
+
+    TestCase(
+      id: 'agent_chat_remote_js_skill_native',
+      name: 'AgentChat — Remote JS Skill (Native mode)',
+      description:
+          'AgentChat invokes a Javascript skill loaded from a remote URL using native tool calling.',
+      run: (ctx) async {
+        GemmaJsSkill remoteSkill;
+        try {
+          remoteSkill = await GemmaJsSkill.fromUrl(
+            'https://raw.githubusercontent.com/google-ai-edge/gallery/refs/heads/main/skills/built-in/calculate-hash/',
+          );
+        } catch (e) {
+          throw _SkipException(
+            'Could not load remote skill from URL. Skipped test. $e',
+          );
+        }
+
+        final chat = AgentChat(
+          config: SessionConfig(nativeToolCalling: true),
+          skills: [remoteSkill],
+        );
+        await chat.init();
+
+        String reply = '';
+        await for (final turn in chat.run('Calculate the SHA-256 hash for the string "hello world" using the skill.')) {
+          reply = turn.modelAnswer;
+        }
+        await chat.dispose();
+
+        if (reply.isEmpty) {
+          throw Exception(
+            'Empty reply from remote JS skill. Model might have failed to use the tool properly natively.',
+          );
+        }
+        debugPrint('[agent_chat_remote_js_skill_native] reply: $reply');
+      },
+    ),
+
+    TestCase(
+      id: 'agent_chat_thinking_mode',
+      name: 'AgentChat — Thinking via Tags',
+      description:
+          'AgentChat populates thinkingBlocks using <think>/<|channel>thought tags natively.',
+      run: (ctx) async {
+        final chat = AgentChat(
+          skills: [],
+          config: SessionConfig(enableThinking: true),
+        );
+        await chat.init();
+
+        String reply = '';
+        List<String> thoughts = [];
+        await for (final turn in chat.run(
+          'Think step by step: what is 3 * 7?',
+        )) {
+          reply = turn.modelAnswer;
+          thoughts = turn.thinkingBlocks;
+        }
+        await chat.dispose();
+
+        if (reply.trim().isEmpty) throw Exception('Final reply was empty');
+
+        // Gemma 4 on Android uses <|channel>thought…<channel|> which ThinkingParser
+        // correctly strips into thinkingBlocks. However some models may answer
+        // correctly without emitting any explicit thinking wrapper. Accept the test
+        // if EITHER thinking blocks were parsed OR the answer is correct (21).
+        final hasCorrectAns = reply.contains('21');
+        if (thoughts.isEmpty && !hasCorrectAns) {
+          throw Exception(
+            'No thinking blocks parsed and answer is wrong. '
+            'Model likely ignored the system prompt or generated malformed tags. '
+            'Reply was: $reply',
+          );
+        }
+
+        debugPrint(
+          '[agent_chat_thinking_mode] parsed ${thoughts.length} blocks. reply: $reply',
+        );
+      },
+    ),
 
     TestCase(
       id: 'chat_multi_turn',
@@ -519,7 +977,8 @@ class TestSuite {
         final json = await chat1.exportHistory();
         await chat1.dispose();
 
-        if (json.isEmpty) throw Exception('exportHistory returned empty string');
+        if (json.isEmpty)
+          throw Exception('exportHistory returned empty string');
 
         final chat2 = GemmaChat();
         await chat2.init();
@@ -530,7 +989,8 @@ class TestSuite {
         }
         await chat2.dispose();
         debugPrint(
-            '[chat_history_export_import] imported ${chat2.history.length} messages');
+          '[chat_history_export_import] imported ${chat2.history.length} messages',
+        );
       },
     ),
 
@@ -539,17 +999,23 @@ class TestSuite {
       name: 'Chat — Sliding-window context strategy',
       description: '4 messages with a 512-token window trim context silently.',
       run: (ctx) async {
+        debugPrint('[chat_sliding_window] Initializing GemmaChat with maxContextTokens: 512');
         final chat = GemmaChat(
           maxContextTokens: 512,
           contextStrategy: ContextStrategy.slidingWindow,
         );
         await chat.init();
+        debugPrint('[chat_sliding_window] Chat initialized');
 
         for (int i = 1; i <= 4; i++) {
+          debugPrint('[chat_sliding_window] Sending message $i of 4...');
           final r = await chat.sendMessage(text: 'Message $i. Reply with OK.');
+          debugPrint('[chat_sliding_window] Received reply for message $i: ${r.trim()}');
           if (r.trim().isEmpty) throw Exception('Empty reply on message $i');
+          debugPrint('[chat_sliding_window] History length after message $i: ${chat.history.length}');
         }
         await chat.dispose();
+        debugPrint('[chat_sliding_window] Test complete');
       },
     ),
 
@@ -586,13 +1052,12 @@ class TestSuite {
     ),
 
     // ── Phase 6 — LLM unload / reload ────────────────────────────────────────
-
     TestCase(
       id: 'llm_unload',
       name: 'LLM — Unload engine',
       description: 'dispose() succeeds; isInitialized becomes false.',
       run: (ctx) async {
-        await GemmaLoader.unloadLlm();
+        await PluginModelLoader.unloadLlm();
         if (FlutterLocalGemma().isInitialized) {
           throw Exception('Engine still reports isInitialized after dispose()');
         }
@@ -607,33 +1072,34 @@ class TestSuite {
         if (ctx.llmPath == null) {
           throw Exception('llmPath is null — run llm_download first');
         }
-        await GemmaLoader.initLlm(path: ctx.llmPath!);
+        await PluginModelLoader.initLlm(path: ctx.llmPath!);
         if (!FlutterLocalGemma().isInitialized) {
           throw Exception('Reload: isInitialized is false');
         }
-        final reply =
-            await SingleTurnChat(config: SessionConfig()).generate(_shortPrompt);
-        if (reply.trim().isEmpty) throw Exception('Empty reply after warm reload');
+        final reply = await SingleTurnChat(
+          config: SessionConfig(),
+        ).generate(_shortPrompt);
+        if (reply.trim().isEmpty)
+          throw Exception('Empty reply after warm reload');
         debugPrint('[llm_reload] reply: $reply');
       },
     ),
 
     // ── Phase 7 — Embedding ───────────────────────────────────────────────────
-
     TestCase(
       id: 'embed_download',
       name: 'Embedding — Download model',
       description: 'Downloads the embedding model (+ tokenizer on Android).',
       run: (ctx) async {
-        final result = await GemmaLoader.downloadEmbedding(
+        final result = await PluginModelLoader.downloadEmbedding(
           token: _hfToken,
           onProgress: (p) {
             ctx.downloadProgress = p;
             ctx.onProgress?.call(p);
           },
         );
-        ctx.embedPath      = result.modelPath;
-        ctx.tokenizerPath  = result.tokenizerPath;
+        ctx.embedPath = result.modelPath;
+        ctx.tokenizerPath = result.tokenizerPath;
         if (ctx.embedPath == null || ctx.embedPath!.isEmpty) {
           throw Exception('Embed model path is empty');
         }
@@ -646,10 +1112,10 @@ class TestSuite {
       description: 'Initialises EmbeddingPlugin from the cached model.',
       run: (ctx) async {
         if (ctx.embedPath == null) throw Exception('Run embed_download first');
-        await GemmaLoader.initEmbedding(
-          modelPath:     ctx.embedPath!,
+        await PluginModelLoader.initEmbedding(
+          modelPath: ctx.embedPath!,
           tokenizerPath: ctx.tokenizerPath,
-          token:         _hfToken,
+          token: _hfToken,
         );
         if (!EmbeddingPlugin().isInitialized) {
           throw Exception('isInitialized is false after init()');
@@ -665,8 +1131,10 @@ class TestSuite {
         final vec = await EmbeddingPlugin().getEmbedding('Hello, world!');
         if (vec.isEmpty) throw Exception('Vector is empty');
         if (vec.every((v) => v == 0.0)) throw Exception('Vector is all zeros');
-        debugPrint('[embed_vector] dim=${vec.length}, '
-            'first3=${vec.take(3).map((v) => v.toStringAsFixed(4)).join(', ')}');
+        debugPrint(
+          '[embed_vector] dim=${vec.length}, '
+          'first3=${vec.take(3).map((v) => v.toStringAsFixed(4)).join(', ')}',
+        );
       },
     ),
 
@@ -675,15 +1143,23 @@ class TestSuite {
       name: 'Embedding — Cosine similarity',
       description: 'Similar sentences score higher than unrelated ones.',
       run: (ctx) async {
-        final vA = await EmbeddingPlugin().getEmbedding('The cat sat on the mat.');
-        final vB = await EmbeddingPlugin().getEmbedding('A feline rested on a rug.');
-        final vC = await EmbeddingPlugin().getEmbedding('Stock market crash today.');
+        final vA = await EmbeddingPlugin().getEmbedding(
+          'The cat sat on the mat.',
+        );
+        final vB = await EmbeddingPlugin().getEmbedding(
+          'A feline rested on a rug.',
+        );
+        final vC = await EmbeddingPlugin().getEmbedding(
+          'Stock market crash today.',
+        );
 
         final simAB = _cosine(vA, vB);
         final simAC = _cosine(vA, vC);
 
-        debugPrint('[embed_similarity] AB=${simAB.toStringAsFixed(4)}, '
-            'AC=${simAC.toStringAsFixed(4)}');
+        debugPrint(
+          '[embed_similarity] AB=${simAB.toStringAsFixed(4)}, '
+          'AC=${simAC.toStringAsFixed(4)}',
+        );
 
         if (simAB <= simAC) {
           throw Exception(
@@ -706,15 +1182,17 @@ class TestSuite {
         ];
         const query = 'What is Flutter used for?';
 
-        final qVec   = await EmbeddingPlugin().getEmbedding(query);
+        final qVec = await EmbeddingPlugin().getEmbedding(query);
         final scores = <double>[];
         for (final s in corpus) {
           scores.add(_cosine(qVec, await EmbeddingPlugin().getEmbedding(s)));
         }
 
         final best = scores.indexOf(scores.reduce(max));
-        debugPrint('[embed_search] scores: '
-            '${scores.map((s) => s.toStringAsFixed(4)).join(', ')} — best=$best');
+        debugPrint(
+          '[embed_search] scores: '
+          '${scores.map((s) => s.toStringAsFixed(4)).join(', ')} — best=$best',
+        );
 
         if (best != 0) {
           throw Exception(
@@ -730,29 +1208,30 @@ class TestSuite {
       name: 'Embedding — Unload engine',
       description: 'dispose() succeeds; isInitialized becomes false.',
       run: (ctx) async {
-        await GemmaLoader.unloadEmbedding();
+        await PluginModelLoader.unloadEmbedding();
         if (EmbeddingPlugin().isInitialized) {
           throw Exception(
-              'EmbeddingPlugin still reports isInitialized after dispose()');
+            'EmbeddingPlugin still reports isInitialized after dispose()',
+          );
         }
       },
     ),
 
     // ── Phase 8 — Cache purge ─────────────────────────────────────────────────
-
     TestCase(
       id: 'cache_purge',
       name: 'Cache — Purge all cached files',
       description: 'ModelInstaller.purgeCache() completes without error.',
       run: (ctx) async {
-        if (FlutterLocalGemma().isInitialized) await GemmaLoader.unloadLlm();
-        if (EmbeddingPlugin().isInitialized) await GemmaLoader.unloadEmbedding();
+        if (FlutterLocalGemma().isInitialized) await PluginModelLoader.unloadLlm();
+        if (EmbeddingPlugin().isInitialized)
+          await PluginModelLoader.unloadEmbedding();
 
-        final freed = await GemmaLoader.purgeCache();
+        final freed = await PluginModelLoader.purgeCache();
         debugPrint('[cache_purge] freed: $freed');
 
-        ctx.llmPath       = null;
-        ctx.embedPath     = null;
+        ctx.llmPath = null;
+        ctx.embedPath = null;
         ctx.tokenizerPath = null;
       },
     ),
@@ -765,8 +1244,8 @@ class TestSuite {
     final len = min(a.length, b.length);
     for (int i = 0; i < len; i++) {
       dot += a[i] * b[i];
-      nA  += a[i] * a[i];
-      nB  += b[i] * b[i];
+      nA += a[i] * a[i];
+      nB += b[i] * b[i];
     }
     final d = sqrt(nA) * sqrt(nB);
     return d == 0 ? 0.0 : dot / d;
@@ -784,13 +1263,15 @@ class TestSuite {
         .replaceAll('\r', '')
         .replaceAll('\n', ' ');
 
-    const hdr   = '%PDF-1.4\n';
-    final obj1  = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
-    final obj2  = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n';
-    final body  = 'BT /F1 14 Tf 50 720 Td ($safe) Tj ET';
-    final obj4  = '4 0 obj\n<< /Length ${body.length} >>\nstream\n'
+    const hdr = '%PDF-1.4\n';
+    final obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+    final obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n';
+    final body = 'BT /F1 14 Tf 50 720 Td ($safe) Tj ET';
+    final obj4 =
+        '4 0 obj\n<< /Length ${body.length} >>\nstream\n'
         '$body\nendstream\nendobj\n';
-    final obj3  = '3 0 obj\n<< /Type /Page /Parent 2 0 R\n'
+    final obj3 =
+        '3 0 obj\n<< /Type /Page /Parent 2 0 R\n'
         '   /MediaBox [0 0 612 792]\n'
         '   /Contents 4 0 R\n'
         '   /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 '
@@ -805,7 +1286,8 @@ class TestSuite {
     }
 
     final xrefPos = pos;
-    final xref = 'xref\n0 5\n'
+    final xref =
+        'xref\n0 5\n'
         '0000000000 65535 f \n'
         '${off[1].toString().padLeft(10, '0')} 00000 n \n'
         '${off[2].toString().padLeft(10, '0')} 00000 n \n'

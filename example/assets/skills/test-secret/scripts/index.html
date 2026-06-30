@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<body>
+  <script>
+    window.ai_edge_gallery_get_result = async (rawArgs, secret) => {
+      // The secret is passed as the second argument from the host
+      return {
+        result: `The secret key is: ${secret || "NO_SECRET_PROVIDED"}`
+      };
+    };
+  </script>
+</body>
+</html>

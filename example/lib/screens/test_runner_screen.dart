@@ -5,6 +5,7 @@
 
 import 'package:flutter/material.dart';
 import '../testing/test_suite.dart';
+import '../app_state.dart';
 
 class TestRunnerScreen extends StatefulWidget {
   const TestRunnerScreen({super.key});
@@ -21,6 +22,8 @@ class _TestRunnerScreenState extends State<TestRunnerScreen> {
     super.initState();
     _suite = TestSuite(onUpdate: () { if (mounted) setState(() {}); });
     _suite.ctx.onProgress = (_) { if (mounted) setState(() {}); };
+    // Seed the already-loaded model path so tests don't re-download
+    _suite.ctx.llmPath ??= ModelManager.instance.llmModelPath;
   }
 
   @override
@@ -242,6 +245,15 @@ class _TestRow extends StatelessWidget {
                           color: color),
                     ),
                   ),
+                  if (onRerun != null && !spin)
+                    IconButton(
+                      icon: const Icon(Icons.play_arrow, size: 16),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      splashRadius: 16,
+                      onPressed: onRerun,
+                    ),
+                  const SizedBox(width: 8),
                   if (tc.duration != null)
                     Text(
                       _fmt(tc.duration!),

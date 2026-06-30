@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>QR Code Skill</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body>
+  <div id="qrcode"></div>
+  <script>
+    async function ai_edge_gallery_get_result(data, secret) {
+      const args = JSON.parse(data);
+      const text = args.text;
+      return new Promise((resolve) => {
+        try {
+          const el = document.getElementById("qrcode");
+          el.innerHTML = "";
+          new QRCode(el, { text: text, width: 256, height: 256 });
+          setTimeout(() => {
+            const canvas = el.querySelector("canvas");
+            if (canvas) {
+              const base64 = canvas.toDataURL("image/png").split(",")[1];
+              resolve(JSON.stringify({ image: { base64: base64 }, result: "QR code generated" }));
+            } else {
+              resolve(JSON.stringify({ error: "Failed to generate canvas" }));
+            }
+          }, 100);
+        } catch (e) {
+          resolve(JSON.stringify({ error: e.toString() }));
+        }
+      });
+    }
+  </script>
+</body>
+</html>

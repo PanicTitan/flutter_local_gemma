@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Calculator Skill</title>
+</head>
+<body>
+  <script>
+    async function ai_edge_gallery_get_result(data, secret) {
+      const args = JSON.parse(data);
+      const expr = args.expression;
+      try {
+        const result = eval(expr);
+        return JSON.stringify({ result: result.toString() });
+      } catch (e) {
+        return JSON.stringify({ error: e.toString() });
+      }
+    }
+  </script>
+</body>
+</html>

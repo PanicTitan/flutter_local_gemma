@@ -1,12 +1,16 @@
 import 'package:flutter/material.dart';
 import 'app_state.dart';
 import 'screens/chat_screen.dart';
+import 'screens/models_screen.dart';
 import 'screens/embedding_screen.dart';
-import 'screens/smart_chat_screen.dart';
 import 'screens/benchmark_screen.dart';
 import 'screens/test_runner_screen.dart';
+import 'package:flutter_local_gemma/utils/gemma_debug.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  GemmaDebug.enabled = true;
+  await GemmaDebug.setNativeDebug(true);
   runApp(const AIPlaygroundApp());
 }
 
@@ -40,10 +44,10 @@ class _MainShellState extends State<_MainShell> {
 
   static const _screens = [
     ChatScreen(),
+    ModelsScreen(),
     EmbeddingScreen(),
-    SmartChatScreen(),
     BenchmarkScreen(),
-    TestRunnerScreen(),   // ← new
+    TestRunnerScreen(),
   ];
 
   @override
@@ -55,10 +59,10 @@ class _MainShellState extends State<_MainShell> {
         onDestinationSelected: (i) => setState(() => _currentIndex = i),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.chat_bubble_outline),  selectedIcon: Icon(Icons.chat_bubble),   label: 'Chat'),
-          NavigationDestination(icon: Icon(Icons.hub_outlined),          selectedIcon: Icon(Icons.hub),           label: 'Embeddings'),
-          NavigationDestination(icon: Icon(Icons.auto_awesome_outlined), selectedIcon: Icon(Icons.auto_awesome),  label: 'Smart Chat'),
-          NavigationDestination(icon: Icon(Icons.speed_outlined),        selectedIcon: Icon(Icons.speed),         label: 'Benchmark'),
-          NavigationDestination(icon: Icon(Icons.science_outlined),      selectedIcon: Icon(Icons.science),       label: 'Tests'),
+          NavigationDestination(icon: Icon(Icons.memory_outlined),      selectedIcon: Icon(Icons.memory),        label: 'Models'),
+          NavigationDestination(icon: Icon(Icons.hub_outlined),         selectedIcon: Icon(Icons.hub),           label: 'Embeds'),
+          NavigationDestination(icon: Icon(Icons.speed_outlined),       selectedIcon: Icon(Icons.speed),         label: 'Bench'),
+          NavigationDestination(icon: Icon(Icons.science_outlined),     selectedIcon: Icon(Icons.science),       label: 'Tests'),
         ],
       ),
     );

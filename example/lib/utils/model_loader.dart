@@ -1,11 +1,12 @@
 // lib/utils/model_loader.dart
 //
 // Thin adapter between the example-app's [ModelManager] state machine and the
-// stateless [GemmaLoader] / [GemmaModelPicker] helpers from the plugin.
+// stateless [PluginModelLoader] / [GemmaModelPicker] helpers from the plugin.
 //
 // All heavy lifting (URL selection, installer calls, EmbeddingConfig wiring)
 // now lives in the plugin; this file only bridges status updates.
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_local_gemma/flutter_local_gemma.dart';
 import 'package:flutter_local_gemma/helpers/model_loader.dart';
 import 'package:flutter_local_gemma/model_picker/model_picker.dart';
@@ -19,6 +20,8 @@ const _hfToken = 'hf_YOUR_TOKEN_HERE';
 /// [onProgress] receives [0, 100] during the download phase.
 Future<void> loadLlm({
   bool local = false,
+  GemmaModel? model,
+  bool enableMtp = true,
   void Function(double)? onProgress,
 }) async {
   final mgr = ModelManager.instance;
@@ -38,11 +41,15 @@ Future<void> loadLlm({
 
     mgr.llmModelPath = localPath; // null when downloading (resolved after)
 
-    await GemmaLoader.loadLlm(
+    mgr.llmModelPath = await PluginModelLoader.loadLlm(
       localPath: localPath,
+      networkUrl: model != null
+          ? (kIsWeb ? model.webUrl : model.androidUrl)
+          : null,
       token: _hfToken,
       maxTokens: mgr.maxTokens + 1024,
       useGpu: mgr.useGpu,
+      enableMtp: enableMtp,
       supportAudio: mgr.supportAudio,
       onProgress: (p) {
         onProgress?.call(p);
@@ -62,7 +69,7 @@ Future<void> loadLlm({
 Future<void> unloadLlm() async {
   final mgr = ModelManager.instance;
   try {
-    await GemmaLoader.unloadLlm();
+    await PluginModelLoader.unloadLlm();
     mgr.setLlmStatus(ModelStatus.unloaded);
   } catch (e) {
     mgr.setLlmStatus(ModelStatus.error, error: e.toString());
@@ -85,14 +92,14 @@ Future<void> loadEmbedding({
         mgr.setEmbeddingStatus(ModelStatus.unloaded);
         return;
       }
-      await GemmaLoader.initEmbedding(
+      await PluginModelLoader.initEmbedding(
         modelPath: localPath,
         useGpu: mgr.useGpu,
         token: _hfToken,
       );
     } else {
       mgr.setEmbeddingStatus(ModelStatus.downloading, error: null);
-      await GemmaLoader.loadEmbedding(
+      await PluginModelLoader.loadEmbedding(
         token: _hfToken,
         useGpu: mgr.useGpu,
         onProgress: (p) {
@@ -113,7 +120,7 @@ Future<void> loadEmbedding({
 Future<void> unloadEmbedding() async {
   final mgr = ModelManager.instance;
   try {
-    await GemmaLoader.unloadEmbedding();
+    await PluginModelLoader.unloadEmbedding();
     mgr.setEmbeddingStatus(ModelStatus.unloaded);
   } catch (e) {
     mgr.setEmbeddingStatus(ModelStatus.error, error: e.toString());

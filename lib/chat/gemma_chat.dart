@@ -5,8 +5,11 @@ import 'package:flutter/foundation.dart';
 
 import '../types/content_parts.dart';
 import '../gemma/gemma.dart';
+import '../gemma/gemma_response.dart';
+import '../gemma/thinking_parser.dart';
 import '../json_schema/json_repair.dart';
 import '../json_schema/schema.dart';
+import 'base_chat.dart';
 
 // ─── Supporting types ─────────────────────────────────────────────────────────
 
@@ -28,12 +31,16 @@ class ChatMessage {
   final String text;
   final List<Uint8List> images;
   final List<Uint8List> audios;
+  final bool isHidden;
+  final bool isUiOnly;
 
   const ChatMessage({
     required this.role,
     required this.text,
     this.images = const [],
     this.audios = const [],
+    this.isHidden = false,
+    this.isUiOnly = false,
   });
 
   // ── Serialization ──────────────────────────────────────────────────────────
@@ -47,6 +54,8 @@ class ChatMessage {
         'text': text,
         'images': images.map((b) => base64Encode(b)).toList(),
         'audios': audios.map((b) => base64Encode(b)).toList(),
+        'isHidden': isHidden,
+        'isUiOnly': isUiOnly,
       };
 
   /// Restores a [ChatMessage] from its [toJson] representation.
@@ -59,6 +68,8 @@ class ChatMessage {
         audios: (json['audios'] as List<dynamic>? ?? [])
             .map((s) => base64Decode(s as String))
             .toList(),
+        isHidden: json['isHidden'] as bool? ?? false,
+        isUiOnly: json['isUiOnly'] as bool? ?? false,
       );
 }
 
@@ -96,12 +107,17 @@ class ChatMessage {
 /// // later…
 /// await chat.importHistory(await prefs.getString('chat_history')!);
 /// ```
-class GemmaChat {
+class GemmaChat implements BaseChat {
   final FlutterLocalGemma _engine = FlutterLocalGemma();
 
   final int maxContextTokens;
   final String? systemPrompt;
   final ContextStrategy contextStrategy;
+  final SessionConfig? config;
+
+  /// Fraction of the context window that triggers context management and
+  /// the [isNearContextLimit] flag. Default is 0.8 (80%).
+  final double contextFillThreshold;
 
   ChatSession? _nativeSession;
   final List<ChatMessage> _history = [];
@@ -111,6 +127,8 @@ class GemmaChat {
     this.maxContextTokens = 4096,
     this.systemPrompt,
     this.contextStrategy = ContextStrategy.none,
+    this.config,
+    this.contextFillThreshold = 0.8,
   });
 
   // ── Public state ──────────────────────────────────────────────────────────
@@ -129,6 +147,8 @@ class GemmaChat {
     int total = 0;
     if (_lastUsedSystemPrompt != null) {
       total += (_lastUsedSystemPrompt!.length / 4).ceil();
+    } else if (systemPrompt != null) {
+      total += (systemPrompt!.length / 4).ceil();
     }
     for (final msg in _history) {
       total += (msg.text.length / 4).ceil();
@@ -145,15 +165,32 @@ class GemmaChat {
   int get remainingTokens =>
       (maxContextTokens - currentTokenCount).clamp(0, maxContextTokens);
 
-  /// Whether the conversation is approaching the context window limit (≥ 80%).
+  /// Whether the conversation is approaching the context window limit.
+  ///
+  /// Returns `true` when [currentTokenCount] exceeds
+  /// `maxContextTokens * contextFillThreshold`.
   bool get isNearContextLimit =>
-      currentTokenCount >= (maxContextTokens * 0.8).toInt();
+      currentTokenCount >= (maxContextTokens * contextFillThreshold).toInt();
 
   /// A snapshot of the current token usage and capacity.
   TokenStats get tokenStats => TokenStats(
         estimatedUsed: currentTokenCount,
         maxContext: maxContextTokens,
       );
+
+  @override
+  Future<int> estimateNextTurnTokens(
+    String prompt, {
+    List<Uint8List>? images,
+    List<Uint8List>? audios,
+  }) async {
+    int nextTokens = (prompt.length / 4).ceil();
+    if (images != null) nextTokens += images.length * 257;
+    if (audios != null) {
+      nextTokens += audios.fold<int>(0, (sum, a) => sum + (a.length ~/ 32) ~/ 150);
+    }
+    return currentTokenCount + nextTokens;
+  }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -191,25 +228,30 @@ class GemmaChat {
     List<Uint8List>? images,
     List<Uint8List>? audios,
     String? overrideSystemPrompt,
+    bool isHidden = false,
+    bool hideModelResponse = false,
   }) async* {
     final targetPrompt = overrideSystemPrompt ?? systemPrompt;
-
-    if (!kIsWeb) {
-      // Rebuild the native context when the system prompt changes.
-      // Pass targetPrompt explicitly so _rebuildNativeContext forwards it to
-      // _initNativeSession — without this the JSON override is silently dropped.
-      if (targetPrompt != _lastUsedSystemPrompt || _nativeSession == null) {
-        _lastUsedSystemPrompt = targetPrompt;
-        await _rebuildNativeContext(withPrompt: targetPrompt);
-      }
-      await _manageContextWindow(text, images ?? [], audios ?? []);
+    final promptChanged = targetPrompt != _lastUsedSystemPrompt;
+    
+    if (promptChanged) {
+      _lastUsedSystemPrompt = targetPrompt;
     }
+
+    // Rebuild the native context when the system prompt changes.
+    // Pass targetPrompt explicitly so _rebuildNativeContext forwards it to
+    // _initNativeSession — without this the JSON override is silently dropped.
+    if (promptChanged || (!kIsWeb && _nativeSession == null)) {
+      await _rebuildNativeContext(withPrompt: targetPrompt);
+    }
+    await _manageContextWindow(text, images ?? [], audios ?? []);
 
     _history.add(ChatMessage(
       role: 'user',
       text: text,
       images: images ?? [],
       audios: audios ?? [],
+      isHidden: isHidden,
     ));
 
     final Stream<String> responseStream = kIsWeb
@@ -217,12 +259,25 @@ class GemmaChat {
         : await _handleNativeTurn(text, images, audios);
 
     final buffer = StringBuffer();
-    await for (final chunk in responseStream) {
+    await for (var chunk in responseStream) {
+      if (chunk.contains('<end_of_turn>')) {
+        chunk = chunk.replaceAll('<end_of_turn>', '');
+      }
       buffer.write(chunk);
-      yield chunk;
+      if (chunk.isNotEmpty) yield chunk;
     }
 
-    _history.add(ChatMessage(role: 'model', text: buffer.toString()));
+    var finalText = buffer.toString().replaceAll('<end_of_turn>', '').trim();
+
+    _history.add(ChatMessage(role: 'model', text: finalText, isHidden: hideModelResponse));
+  }
+
+  /// Appends a message directly to the conversation history and native context.
+  Future<void> appendMessage(ChatMessage message) async {
+    _history.add(message);
+    if (!message.isUiOnly && !kIsWeb && _nativeSession != null) {
+      await _nativeSession!.addToContext(_formatMessageParts(message, isLast: false));
+    }
   }
 
   /// Sends a message and returns the model's response as a single [String].
@@ -231,6 +286,7 @@ class GemmaChat {
     List<Uint8List>? images,
     List<Uint8List>? audios,
     String? overrideSystemPrompt,
+    bool isHidden = false,
   }) async {
     final buffer = StringBuffer();
     await for (final chunk in sendMessageStream(
@@ -238,6 +294,7 @@ class GemmaChat {
       images: images,
       audios: audios,
       overrideSystemPrompt: overrideSystemPrompt,
+      isHidden: isHidden,
     )) {
       buffer.write(chunk);
     }
@@ -303,6 +360,40 @@ CRITICAL RULES:
   /// Stops the current generation mid-stream.
   Future<void> stop() async => _nativeSession?.stopGeneration();
 
+  /// Streams typed [GemmaResponse] events, separating thinking content from
+  /// final answer tokens.
+  ///
+  /// Only meaningful when `SessionConfig.enableThinking = true` (Gemma 4).
+  /// When thinking is disabled, only [GemmaTextResponse] events are emitted.
+  ///
+  /// ```dart
+  /// await for (final resp in chat.sendMessageResponseStream(text: 'Solve 17×19')) {
+  ///   switch (resp) {
+  ///     case GemmaThinkingResponse(:final content):
+  ///       print('Thinking: $content');
+  ///     case GemmaTextResponse(:final token):
+  ///       print(token);
+  ///   }
+  /// }
+  /// ```
+  Stream<GemmaResponse> sendMessageResponseStream({
+    required String text,
+    List<Uint8List>? images,
+    List<Uint8List>? audios,
+    String? overrideSystemPrompt,
+    bool isHidden = false,
+  }) {
+    return ThinkingParser.filterThinkingStream(
+      sendMessageStream(
+        text: text,
+        images: images,
+        audios: audios,
+        overrideSystemPrompt: overrideSystemPrompt,
+        isHidden: isHidden,
+      ),
+    );
+  }
+
   // ── History management ────────────────────────────────────────────────────
 
   /// Removes all messages from the history and resets the native context.
@@ -311,11 +402,14 @@ CRITICAL RULES:
     await _rebuildNativeContext();
   }
 
-  /// Replaces the message at [index] with [newMessage] and rebuilds the context.
-  Future<void> editHistory(int index, ChatMessage newMessage) async {
+  /// Replaces the message at [index] with [newMessage].
+  /// If [rebuildContext] is true, the native context is destroyed and rebuilt.
+  Future<void> editHistory(int index, ChatMessage newMessage, {bool rebuildContext = true}) async {
     if (index < 0 || index >= _history.length) return;
     _history[index] = newMessage;
-    await _rebuildNativeContext();
+    if (rebuildContext) {
+      await _rebuildNativeContext();
+    }
   }
 
   /// Removes the message at [index] from the history and rebuilds the context.
@@ -392,9 +486,7 @@ CRITICAL RULES:
   Future<void> _initNativeSession({String? ephemeralPrompt}) async {
     _lastUsedSystemPrompt = ephemeralPrompt ?? systemPrompt;
     _nativeSession = await _engine.createSession(
-      config: SessionConfig(
-        temperature:  0.7,
-        topK:         40,
+      config: (config ?? SessionConfig()).copyWith(
         systemPrompt: _lastUsedSystemPrompt,
       ),
     );
@@ -413,6 +505,7 @@ CRITICAL RULES:
     _nativeSession = null;
     await _initNativeSession(ephemeralPrompt: effectivePrompt);
     for (final msg in _history) {
+      if (msg.isUiOnly) continue;
       await _nativeSession?.addToContext(
         _formatMessageParts(msg, isLast: false),
       );
@@ -488,7 +581,9 @@ CRITICAL RULES:
   Future<Stream<String>> _handleWebTurn(String? targetPrompt) async {
     await _nativeSession?.clearContext();
     _nativeSession = await _engine.createSession(
-      config: SessionConfig(temperature: 0.7, topK: 40),
+      config: (config ?? SessionConfig()).copyWith(
+        systemPrompt: null, // system prompt is injected manually below
+      ),
     );
 
     // Re-inject the system prompt manually in Gemma's chat template format.
@@ -501,13 +596,23 @@ CRITICAL RULES:
     // Replay history (excluding the very last message which is the user turn
     // we are about to generate a response for).
     for (int i = 0; i < _history.length - 1; i++) {
+      if (_history[i].isUiOnly) continue;
       await _nativeSession!.addToContext(
         _formatMessageParts(_history[i], isLast: false),
       );
     }
 
+    // Find the last non-UiOnly message (which should be the user message)
+    ChatMessage lastMsg = _history.last;
+    for (int i = _history.length - 1; i >= 0; i--) {
+      if (!_history[i].isUiOnly) {
+        lastMsg = _history[i];
+        break;
+      }
+    }
+
     return _nativeSession!.generateResponseStream(
-      _formatMessageParts(_history.last, isLast: true),
+      _formatMessageParts(lastMsg, isLast: true),
     );
   }
 

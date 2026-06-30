@@ -1,4 +1,6 @@
+import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 import '../flutter_local_gemma.dart';
 
 // ── Default model URLs ────────────────────────────────────────────────────────
@@ -35,7 +37,7 @@ const _tokUrl =
 ///
 /// await GemmaLoader.unloadLlm();
 /// ```
-abstract final class GemmaLoader {
+abstract final class PluginModelLoader {
   // ── LLM ──────────────────────────────────────────────────────────────────
 
   /// Downloads the LLM model from [networkUrl] (or the built-in default) and
@@ -64,20 +66,26 @@ abstract final class GemmaLoader {
     bool useGpu = true,
     bool supportAudio = true,
     int maxNumImages = 10,
-  }) =>
-      FlutterLocalGemma().init(InferenceConfig(
-        modelPath: path,
-        maxTokens: maxTokens,
-        backend:
-            kIsWeb ? null : (useGpu ? PreferredBackend.gpu : PreferredBackend.cpu),
-        maxNumImages: maxNumImages,
-        supportAudio: supportAudio,
-      ));
+    bool enableMtp = true,
+    String? modelName,
+  }) => FlutterLocalGemma().init(
+    InferenceConfig(
+      modelPath: path,
+      maxTokens: maxTokens,
+      backend: kIsWeb
+          ? null
+          : (useGpu ? PreferredBackend.gpu : PreferredBackend.cpu),
+      maxNumImages: maxNumImages,
+      supportAudio: supportAudio,
+      enableMtp: enableMtp,
+      modelName: modelName,
+    ),
+  );
 
   /// Convenience wrapper: [downloadLlm] → [initLlm] in a single call.
   ///
   /// [onProgress] covers the download phase; the init phase has no progress.
-  static Future<void> loadLlm({
+  static Future<String> loadLlm({
     String? networkUrl,
     String? localPath,
     String? token,
@@ -85,9 +93,12 @@ abstract final class GemmaLoader {
     bool useGpu = true,
     bool supportAudio = true,
     int maxNumImages = 10,
+    bool enableMtp = true,
+    String? modelName,
     void Function(double progress)? onProgress,
   }) async {
-    final path = localPath ??
+    final path =
+        localPath ??
         await downloadLlm(
           networkUrl: networkUrl,
           token: token,
@@ -99,11 +110,49 @@ abstract final class GemmaLoader {
       useGpu: useGpu,
       supportAudio: supportAudio,
       maxNumImages: maxNumImages,
+      enableMtp: enableMtp,
+      modelName: modelName,
     );
+    return path;
   }
 
   /// Releases the LLM engine from memory.
   static Future<void> unloadLlm() => FlutterLocalGemma().dispose();
+
+  /// Returns the local cache date for a model file, or null if not cached.
+  static Future<DateTime?> modelCachedAt(GemmaModel model) async {
+    if (kIsWeb) {
+      try {
+        final cache = await ModelInstaller.listWebCache();
+        for (final item in cache) {
+          if (item['name'] == model.webFile) {
+            return DateTime.now(); // OPFS doesn't expose modified dates, but the file exists
+          }
+        }
+      } catch (_) {}
+      return null;
+    }
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final file = File('${docs.path}/${model.androidFile}');
+      if (await file.exists()) {
+        final stat = await file.stat();
+        return stat.modified;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Returns true if the model file is cached AND its MTP shard is current
+  /// (for Gemma 4: download date must be >= 2026-05-05).
+  static Future<bool> isModelReady(GemmaModel model) async {
+    final cachedAt = await modelCachedAt(model);
+    if (cachedAt == null) return false;
+    if (model.isGemma4 && cachedAt.isBefore(DateTime(2026, 5, 5))) {
+      return false;
+    }
+    return true;
+  }
 
   // ── Embedding ─────────────────────────────────────────────────────────────
 
@@ -146,13 +195,14 @@ abstract final class GemmaLoader {
     String? tokenizerPath,
     bool useGpu = true,
     String? token,
-  }) =>
-      EmbeddingPlugin().init(EmbeddingConfig(
-        modelPathOrId: modelPath,
-        tokenizerPath: tokenizerPath,
-        useGpu: useGpu,
-        token: token,
-      ));
+  }) => EmbeddingPlugin().init(
+    EmbeddingConfig(
+      modelPathOrId: modelPath,
+      tokenizerPath: tokenizerPath,
+      useGpu: useGpu,
+      token: token,
+    ),
+  );
 
   /// Convenience wrapper: [downloadEmbedding] → [initEmbedding].
   static Future<void> loadEmbedding({

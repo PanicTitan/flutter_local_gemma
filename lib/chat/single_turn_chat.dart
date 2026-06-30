@@ -130,8 +130,14 @@ class SingleTurnChat {
     List<Uint8List>? audios,
     String? systemPrompt,
   }) async {
-    final buffer = StringBuffer();
-    await for (final _ in generateJsonStream(
+    // Accumulate the last emission from generateJsonStream.
+    // generateJsonStream already runs repairJson internally on every chunk,
+    // so the final emission IS the fully-repaired JSON value.
+    // This is one LLM pass — fixes the previous double-call bug where
+    // generateJsonStream was drained (discarding results) and then
+    // generate() was called again independently.
+    dynamic last;
+    await for (final partial in generateJsonStream(
       prompt,
       schema: schema,
       rawSchemaStr: rawSchemaStr,
@@ -139,16 +145,9 @@ class SingleTurnChat {
       audios: audios,
       systemPrompt: systemPrompt,
     )) {
-      // Collect all partial results; we only want the last (complete) one.
+      last = partial;
     }
-    // Run repair on the final accumulated buffer.
-    final raw = await generate(
-      prompt,
-      images: images,
-      audios: audios,
-      systemPrompt: _buildJsonSystemPrompt(schema, rawSchemaStr, systemPrompt),
-    );
-    return repairJson(raw);
+    return last;
   }
 
   /// Streams partial JSON objects as the model fills in fields.
@@ -223,6 +222,10 @@ class SingleTurnChat {
       randomSeed:     _config.randomSeed,
       systemPrompt:   systemPrompt,
       autoStopConfig: _config.autoStopConfig,
+      enableThinking: _config.enableThinking,
+      enableMultimodality: _config.enableMultimodality,
+      skills:         _config.skills,
+      nativeToolCalling: _config.nativeToolCalling,
     );
   }
 

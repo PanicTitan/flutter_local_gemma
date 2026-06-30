@@ -33,4 +33,7 @@ class FlutterLocalGemmaWeb {
 
   Future<void> cancelProcessing() async =>
       throw UnimplementedError('Web engine unavailable on this platform.');
+
+  Future<String> executeJsSkill(String scriptHtml, String argsJson, String secret, int timeoutMs) async =>
+      throw UnimplementedError('Web JS skill execution is only available on Web.');
 }

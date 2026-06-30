@@ -22,5 +22,8 @@ Future<String?> pickModelImpl() async {
 
   final file = await completer.future;
   if (file == null) return null;
-  return FlutterLocalGemma.installModel().fromWebBlob(file);
+  final blobUrl = await FlutterLocalGemma.installModel().fromWebBlob(file);
+  // Append the file name as a hash fragment so detection logic (e.g. isGemma4)
+  // can still read the name from the path string.
+  return '$blobUrl#${file.name}';
 }

@@ -101,7 +101,13 @@ class WebModelDownloader extends ModelDownloaderBuilder {
         (JSNumber p) => onProgressCallback?.call(p.toDartDouble);
     try {
       final result = await _download(url.toJS, token?.toJS, onProg.toJS).toDart;
-      return result.toDart;
+      final blobUrl = result.toDart;
+      // Append the file name as a hash fragment so detection logic
+      // can still read the name from the OPFS blob string.
+      if (!blobUrl.contains('#')) {
+        return '$blobUrl#$fileName';
+      }
+      return blobUrl;
     } catch (e) {
       throw Exception('Web download failed: $e');
     }

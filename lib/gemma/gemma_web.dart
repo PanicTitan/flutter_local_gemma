@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
-import 'package:web/web.dart' as web;
+import 'dart:convert';
 import '../types/content_parts.dart';
 import '../utils/web_script_loader.dart';
 import 'gemma.dart';
@@ -24,6 +24,9 @@ external void _unloadLLM();
 @JS('countTokens')
 external JSPromise<JSNumber> _countTokens(JSString text);
 
+@JS('executeJsSkill')
+external JSPromise<JSString> _executeJsSkill(JSString scriptHtml, JSString argsJson, JSString secret, JSNumber timeoutMs);
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Web implementation of the FlutterLocalGemma engine interface.
@@ -43,24 +46,40 @@ class FlutterLocalGemmaWeb {
   /// Null when idle.
   StreamController<Map<String, dynamic>>? _activeController;
 
+  bool _isGemma4 = false;
+
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   /// Initialises the MediaPipe LLM engine in the browser.
   Future<void> init(InferenceConfig config) async {
     await WebScriptLoader.ensureJsLoaded();
 
-    final options    = JSObject();
-    final baseOpts   = JSObject();
+    final options = JSObject();
+    options.setProperty('modelPath'.toJS, config.modelPath.toJS);
+    options.setProperty('assetBase'.toJS, WebScriptLoader.assetBase.toJS);
 
-    options.setProperty('assetBase'.toJS,  WebScriptLoader.assetBase.toJS);
-    baseOpts.setProperty('modelPath'.toJS, config.modelPath.toJS);
-    options.setProperty('baseOptions'.toJS, baseOpts);
-    options.setProperty('maxTokens'.toJS,   config.maxTokens.toJS);
-    if (config.maxNumImages != null) options.setProperty('maxNumImages'.toJS, config.maxNumImages!.toJS);
-    options.setProperty('supportAudio'.toJS, config.supportAudio.toJS);
+    // Limit Web maxTokens to 8192 (GPU memory limit).
+    final int safeMaxTokens = config.maxTokens.clamp(512, 8192);
+    options.setProperty('maxTokens'.toJS, safeMaxTokens.toJS);
+
+    // IMPORTANT: Do NOT pass supportAudio=true for Gemma 4 web models.
+    // Gemma 4's WASM binary does not include the audio modality — passing
+    // supportAudio causes a 'RuntimeError: memory access out of bounds' crash
+    // during GPU init.  We detect Gemma 4 by its well-known path substrings.
+    // Note: E2B and E4B are Gemma 3 variants and DO support audio/images.
+    _isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
+
+    if (config.maxNumImages != null) {
+      options.setProperty('maxNumImages'.toJS, _isGemma4 ? 0.toJS : config.maxNumImages!.toJS);
+    }
+
+    final effectiveSupportAudio = config.supportAudio && !_isGemma4;
+    options.setProperty('supportAudio'.toJS, effectiveSupportAudio.toJS);
+    options.setProperty('isGemma4'.toJS, _isGemma4.toJS);
 
     await _initLLM(options).toDart;
   }
+
 
   /// Releases the LLM instance and all associated GPU memory from the browser.
   /// After this call [init] must be called again before generating.
@@ -117,16 +136,28 @@ class FlutterLocalGemmaWeb {
       if (part is TextPart) {
         jsArray.add(part.text.toJS);
       } else if (part is ImagePart) {
-        jsArray.add(_bytesToBlobObj(part.bytes, 'imageSource', 'image/png'));
+       
+        final base64String = base64Encode(part.bytes);
+        final mimeType = _detectImageFormat(part.bytes);
+        final dataUrl = 'data:$mimeType;base64,$base64String';
+       
+        final obj = JSObject();
+        obj.setProperty('imageSource'.toJS, dataUrl.toJS);
+        jsArray.add(obj);
       } else if (part is AudioPart) {
-        jsArray.add(_bytesToBlobObj(part.bytes, 'audioSource', 'audio/wav'));
+       
+        final base64String = base64Encode(part.bytes);
+        final dataUrl = 'data:audio/wav;base64,$base64String';
+       
+        final obj = JSObject();
+        obj.setProperty('audioSource'.toJS, dataUrl.toJS);
+        jsArray.add(obj);
       }
     }
     _webBuffer.clear();
 
-    // The callback is typed as `void Function(JSAny, JSAny)` to satisfy
-    // dart:js_interop's strict typing rules.
-    final void Function(JSAny, JSAny) cb = (JSAny res, JSAny done) {
+    // The callback is typed to satisfy dart:js_interop's strict typing rules.
+    void cb(JSAny res, JSAny done) {
       if (controller.isClosed) return;
       final text   = (res  as JSString).toDart;
       final isDone = (done as JSBoolean).toDart;
@@ -135,7 +166,7 @@ class FlutterLocalGemmaWeb {
         controller.close();
         _activeController = null;
       }
-    };
+    }
 
     _generateResponse(jsArray, cb.toJS);
 
@@ -144,15 +175,24 @@ class FlutterLocalGemmaWeb {
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  /// Wraps [bytes] in a JS Blob and returns a JSObject with [key] set to the
-  /// object-URL string, which MediaPipe can consume as a media source.
-  JSObject _bytesToBlobObj(Uint8List bytes, String key, String mime) {
-    final blob = web.Blob(
-      [bytes.toJS].toJS,
-      web.BlobPropertyBag(type: mime),
-    );
-    final obj = JSObject();
-    obj.setProperty(key.toJS, web.URL.createObjectURL(blob).toJS);
-    return obj;
+  String _detectImageFormat(Uint8List bytes) {
+    if (bytes.length >= 2) {
+      if (bytes[0] == 0xFF && bytes[1] == 0xD8) return 'image/jpeg';
+      if (bytes[0] == 0x89 && bytes[1] == 0x50) return 'image/png';
+      if (bytes[0] == 0x47 && bytes[1] == 0x49) return 'image/gif';
+      if (bytes.length >= 12 &&
+          bytes[8] == 0x57 &&
+          bytes[9] == 0x45 &&
+          bytes[10] == 0x42 &&
+          bytes[11] == 0x50) return 'image/webp';
+    }
+    return 'image/jpeg'; // Default fallback
+  }
+
+  /// Executes a JS-based skill inside a sandboxed iframe.
+  Future<String> executeJsSkill(String scriptHtml, String argsJson, String secret, int timeoutMs) async {
+    await WebScriptLoader.ensureJsLoaded();
+    final result = await _executeJsSkill(scriptHtml.toJS, argsJson.toJS, secret.toJS, timeoutMs.toJS).toDart;
+    return result.toDart;
   }
 }

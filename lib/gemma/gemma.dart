@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
@@ -24,6 +23,10 @@ class AutoStopConfig {
   final int maxRepetitions;
 
   /// Minimum length (in characters) of a repeating unit to count as a loop.
+  ///
+  /// **Android note:** this value is NOT forwarded to the native LiteRT-LM SDK.
+  /// The Kotlin side hardcodes 3 regardless of what you set here.
+  /// Only [maxRepetitions] is applied on Android.
   final int minRepeatCharLen;
 
   /// Hard cap on generated tokens (0 = no cap).
@@ -49,24 +52,70 @@ class InferenceConfig {
 
   final int? maxNumImages;
   final bool supportAudio;
+  /// Whether to enable MTP (Multi-Token Prediction / speculative decoding).
+  ///
+  /// **Android note:** This value is **ignored**. MTP is auto-detected from
+  /// the model file via `Capabilities(path).hasSpeculativeDecodingSupport()`.
+  /// If the model contains the MTP drafter shard it will always be enabled;
+  /// if not, it silently remains off. No flag needed from your code.
+  ///
+  /// **Web note:** MTP is not available in the current MediaPipe build and
+  /// this value is silently ignored.
+  final bool enableMtp;
+
+  /// Optional model name used to identify the model version (e.g. for Gemma 4 
+  /// detection on Web when the OPFS URL strips the file name).
+  final String? modelName;
 
   InferenceConfig({
     required this.modelPath,
     this.maxTokens   = 4096,
     this.backend,
-    this.maxNumImages = 10,
-    this.supportAudio = true,
+    this.maxNumImages,
+    this.supportAudio = false,
+    this.enableMtp    = true,
+    this.modelName,
   });
 }
 
 /// Per-session sampling parameters.
+///
+/// **Android sampling note:** [temperature], [topP], and [topK] are currently
+/// not applied on Android. The LiteRT-LM SDK does not expose per-generation
+/// sampling parameters on its Conversation API — these values are logged but
+/// have no effect on the output distribution. They are fully respected on Web.
+/// This will be resolved in a future LiteRT-LM SDK update.
 class SessionConfig {
+  /// Sampling temperature. **Android: no-op** (see class doc).
   final double temperature;
+
+  /// Top-p nucleus sampling. **Android: no-op** (see class doc).
   final double topP;
+
+  /// Top-k sampling. **Android: no-op** (see class doc).
   final int topK;
   final int? randomSeed;
   final String? systemPrompt;
   final AutoStopConfig autoStopConfig;
+  final bool enableThinking;
+  final bool enableMultimodality;
+  final List<Object> skills;
+
+  /// Controls the tool-call architecture used when [AgentChat] is active.
+  ///
+  /// When `false` (default): JSON prompt injection + regex parsing on the Dart side.
+  /// The model outputs `<|tool_call>{"name":...,"arguments":{...}}<tool_call|>` tokens
+  /// which are parsed by [AgentChat].
+  ///
+  /// When `true` (Android only): the LiteRT-LM native constrained decoding path via
+  /// `GemmaAgentToolSet`. The C++ engine calls `load_skill`, `run_js`, and
+  /// `execute_skill` natively. JS skills run in a hidden WebView pool.
+  /// Dart skills receive callbacks via MethodChannel. Falls back to JSON
+  /// prompt mode on Web.
+  ///
+  /// **Note:** This does NOT affect [temperature], [topP], or [topK] — those
+  /// are still no-ops on Android regardless of this value.
+  final bool nativeToolCalling;
 
   SessionConfig({
     this.temperature    = 0.8,
@@ -75,7 +124,51 @@ class SessionConfig {
     this.randomSeed,
     this.systemPrompt,
     this.autoStopConfig = const AutoStopConfig(),
+    this.enableThinking = false,
+    this.enableMultimodality = true,
+    this.skills = const [],
+    this.nativeToolCalling = false,
   });
+
+  // Sentinel object for clearing nullable fields in copyWith.
+  static const _unset = Object();
+
+  /// Returns a copy of this config with the given fields replaced.
+  ///
+  /// To **clear** [randomSeed] or [systemPrompt] back to null, pass
+  /// `clearRandomSeed: true` or `clearSystemPrompt: true`:
+  /// ```dart
+  /// config.copyWith(clearSystemPrompt: true)
+  /// ```
+  SessionConfig copyWith({
+    double? temperature,
+    double? topP,
+    int? topK,
+    Object? randomSeed = _unset,
+    Object? systemPrompt = _unset,
+    AutoStopConfig? autoStopConfig,
+    bool? enableThinking,
+    bool? enableMultimodality,
+    List<Object>? skills,
+    bool? nativeToolCalling,
+  }) {
+    return SessionConfig(
+      temperature: temperature ?? this.temperature,
+      topP: topP ?? this.topP,
+      topK: topK ?? this.topK,
+      randomSeed: identical(randomSeed, _unset)
+          ? this.randomSeed
+          : randomSeed as int?,
+      systemPrompt: identical(systemPrompt, _unset)
+          ? this.systemPrompt
+          : systemPrompt as String?,
+      autoStopConfig: autoStopConfig ?? this.autoStopConfig,
+      enableThinking: enableThinking ?? this.enableThinking,
+      enableMultimodality: enableMultimodality ?? this.enableMultimodality,
+      skills: skills ?? this.skills,
+      nativeToolCalling: nativeToolCalling ?? this.nativeToolCalling,
+    );
+  }
 }
 
 /// Snapshot of the KV-cache / context window usage for a [ChatSession].
@@ -128,6 +221,25 @@ class FlutterLocalGemma {
 
   bool _isInitialized = false;
   int  _maxTokens     = 0;
+  String? _currentModelPath;
+  String? _currentModelName;
+  bool _currentModelIsGemma4 = false;
+
+  Future<dynamic> Function(Map<String, dynamic>)? _nativeToolHandler;
+
+  void setNativeToolHandler(Future<dynamic> Function(Map<String, dynamic>)? handler) {
+    _nativeToolHandler = handler;
+  }
+
+  Future<dynamic> _handleNativeMethodCall(MethodCall call) async {
+    if (call.method == 'executeTool') {
+      if (_nativeToolHandler != null) {
+        final args = Map<String, dynamic>.from(call.arguments as Map);
+        return await _nativeToolHandler!(args);
+      }
+    }
+    throw PlatformException(code: 'Unimplemented', message: 'Method not implemented');
+  }
 
   // ── Copy-progress stream ───────────────────────────────────────────────────
 
@@ -189,6 +301,15 @@ class FlutterLocalGemma {
   /// The maximum context-window size declared during [init].
   int get maxTokens => _maxTokens;
 
+  /// The path of the currently loaded model, or null if none is loaded.
+  String? get currentModelPath => _currentModelPath;
+
+  /// The name of the currently loaded model, or null if unknown.
+  String? get currentModelName => _currentModelName;
+
+  /// Whether the currently loaded model is identified as Gemma 4.
+  bool get currentModelIsGemma4 => _currentModelIsGemma4;
+
   /// Initialises the inference engine.
   ///
   /// Calling [init] when the engine is already initialised is a no-op; call
@@ -196,6 +317,11 @@ class FlutterLocalGemma {
   Future<void> init(InferenceConfig config) async {
     if (_isInitialized) return;
     _maxTokens = config.maxTokens;
+    _currentModelPath = config.modelPath;
+    _currentModelName = config.modelName ?? _extractNameFromPath(config.modelPath);
+    
+    final pathToCheck = (_currentModelName ?? _currentModelPath!).toLowerCase();
+    _currentModelIsGemma4 = pathToCheck.contains('gemma-4') || pathToCheck.contains('gemma_4');
 
     if (kIsWeb) {
       await FlutterLocalGemmaWeb().init(config);
@@ -205,7 +331,7 @@ class FlutterLocalGemma {
       _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
         (event) {
           if (event is Map) {
-            _eventController.add(event as Map<dynamic, dynamic>);
+            _eventController.add(event);
           }
         },
         onError: _eventController.addError,
@@ -217,10 +343,32 @@ class FlutterLocalGemma {
         'preferredBackend': config.backend?.index ?? 0,
         'maxNumImages':    config.maxNumImages,
         'supportAudio':    config.supportAudio,
+        'enableMtp':       config.enableMtp,
       });
+      _channel.setMethodCallHandler(_handleNativeMethodCall);
     }
-
+    
     _isInitialized = true;
+  }
+
+  String? _extractNameFromPath(String path) {
+    if (path.isEmpty) return null;
+    try {
+      // First, check if there's a hash fragment (used by the Web picker).
+      if (path.contains('#')) {
+        final hash = path.split('#').last;
+        if (hash.isNotEmpty) return hash;
+      }
+      // Otherwise, parse the URI and get the last path segment.
+      final uri = Uri.parse(path);
+      if (uri.pathSegments.isNotEmpty) {
+        final name = uri.pathSegments.last;
+        if (name.isNotEmpty) return name;
+      }
+      return path.split('/').last;
+    } catch (_) {
+      return path.split('/').last;
+    }
   }
 
   /// Creates a new [ChatSession] with the given sampling parameters.
@@ -245,6 +393,8 @@ class FlutterLocalGemma {
         'systemPrompt':    conf.systemPrompt,
         'autoStopEnabled': conf.autoStopConfig.enabled,
         'maxRepetitions':  conf.autoStopConfig.maxRepetitions,
+        'enableThinking':  conf.enableThinking,
+        'nativeToolCalling': conf.nativeToolCalling,
       });
       return ChatSession(
         channel:    _channel,
@@ -291,6 +441,7 @@ class FlutterLocalGemma {
     }
 
     _isInitialized = false;
+    _currentModelPath = null;
   }
 
   // ── Internal accessor used by ChatSession ──────────────────────────────────
@@ -312,7 +463,11 @@ class FlutterLocalGemma {
 /// isolate. Heavy work runs on IO threads in native code or in a JS worker.
 class ChatSession {
   final MethodChannel? _channel;
-  final EventChannel?  _stream;   // kept for API-compatibility reference only
+
+  // Kept for API-compatibility reference only — EventChannel subscriptions
+  // are now managed centrally by [FlutterLocalGemma._nativeEventStream].
+  // ignore: unused_field
+  final EventChannel? _stream;
   final int maxContext;
   final SessionConfig? webConfig;
 
@@ -461,14 +616,11 @@ class ChatSession {
     if (_channel == null) return;
     for (final part in parts) {
       if (part is TextPart) {
-        await _channel!
-            .invokeMethod('addQueryChunk', {'prompt': part.text});
+        await _channel.invokeMethod('addQueryChunk', {'prompt': part.text});
       } else if (part is ImagePart) {
-        await _channel!
-            .invokeMethod('addImage', {'imageBytes': part.bytes});
+        await _channel.invokeMethod('addImage', {'imageBytes': part.bytes});
       } else if (part is AudioPart) {
-        await _channel!
-            .invokeMethod('addAudio', {'audioBytes': part.bytes});
+        await _channel.invokeMethod('addAudio', {'audioBytes': part.bytes});
       }
     }
   }

@@ -2,8 +2,6 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-import '../gemma/gemma.dart';
-import '../embedding/embedding_plugin.dart';
 import '../types/content_parts.dart';
 import 'pdf_processor_web.dart' if (dart.library.io) 'pdf_processor_stub.dart';
 

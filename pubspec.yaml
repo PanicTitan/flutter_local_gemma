@@ -1,6 +1,6 @@
 name: flutter_local_gemma
-description: "On-device AI inference for Flutter — Gemma 3 text generation, embeddings, and PDF processing on Android and Web."
-version: 0.1.0
+description: "On-device AI inference for Flutter — Gemma 3n & Gemma 4 text generation, tool calling, thinking, embeddings, and PDF processing on Android and Web."
+version: 0.2.0
 homepage: https://github.com/PanicTitan/flutter_local_gemma
 
 environment:
@@ -13,15 +13,16 @@ dependencies:
   flutter_web_plugins:
     sdk: flutter
 
-  web: ^1.0.0
-  plugin_platform_interface: ^2.0.2
+  web: ^1.1.0
+  plugin_platform_interface: ^2.1.8
 
-  background_downloader: ^9.5.2 # android download
+  background_downloader: ^9.5.4 # android download
   path_provider: ^2.1.5
   collection: ^1.19.1
 
   image: ^4.8.0
   cross_file: ^0.3.5+2
+  webview_flutter: ^4.10.0
 
 dev_dependencies:
   flutter_test:
@@ -56,11 +57,15 @@ flutter:
     - path: web/@litertjs/core/wasm/litert_wasm_compat_internal.wasm
     - path: web/@litertjs/core/wasm/litert_wasm_internal.js
     - path: web/@litertjs/core/wasm/litert_wasm_internal.wasm
+    - path: web/@litertjs/core/wasm/litert_wasm_jspi_internal.js
+    - path: web/@litertjs/core/wasm/litert_wasm_jspi_internal.wasm
     - path: web/@litertjs/core/wasm/litert_wasm_threaded_internal.js
     - path: web/@litertjs/core/wasm/litert_wasm_threaded_internal.wasm
 
     - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_internal.js
     - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_internal.wasm
+    - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_module_internal.js
+    - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_module_internal.wasm
     - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_nosimd_internal.js
     - path: web/@mediapipe/tasks-genai/wasm/genai_wasm_nosimd_internal.wasm
 

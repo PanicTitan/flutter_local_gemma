@@ -38,11 +38,17 @@ const EMBEDDING_SEQ_LEN = 256;
 type ActiveGeneration = { cancel: () => void };
 let activeGeneration: ActiveGeneration | null = null;
 
-// Embeddings
+// Embeddings (LiteRT)
 let tfliteModel: any = null;
 let tokenizer: any = null;
 let currentEmbedModelUrl: string | null = null;
 let isLiteRtRuntimeLoaded = false; // WASM binary; survive model unload
+
+// EmbeddingGemma 2 (Transformers.js + WebGPU)
+let gemma2Model: any = null;
+let gemma2Processor: any = null;
+let gemma2ModelId: string | null = null;
+let gemma2TargetDim: number | null = null;
 
 // PDF
 let pdfWorkerReady = false;
@@ -276,14 +282,139 @@ async function _loadEmbeddingModelBytes(
     return new Uint8Array(await response.arrayBuffer());
 }
 
+/** Normalizes a float vector to unit length (L2 norm). */
+function _l2Normalize(vec: Float32Array): Float32Array {
+    let sum = 0;
+    for (let i = 0; i < vec.length; i++) {
+        sum += vec[i] * vec[i];
+    }
+    const norm = Math.sqrt(sum);
+    if (norm > 0) {
+        for (let i = 0; i < vec.length; i++) {
+            vec[i] /= norm;
+        }
+    }
+    return vec;
+}
+
+/** Optionally truncates vector to targetDimension and re-normalizes. */
+function _applyMatryoshka(vec: Float32Array, targetDim?: number | null): Float32Array {
+    if (targetDim && targetDim < vec.length) {
+        const truncated = vec.slice(0, targetDim);
+        return _l2Normalize(truncated);
+    }
+    return _l2Normalize(vec);
+}
+
+/**
+ * Initialises the EmbeddingGemma 2 model via Transformers.js with WebGPU acceleration.
+ * Falls back gracefully to WASM if WebGPU is not supported by the client browser.
+ */
+(window as any).initEmbeddingGemma2 = async (
+    modelId?: string,
+    token?: string,
+    targetDimension?: number,
+    onProgress?: (progress: number) => void
+): Promise<boolean> => {
+    try {
+        const id = modelId || 'onnx-community/embeddinggemma-2-ONNX';
+        if (gemma2Model && gemma2Processor && gemma2ModelId === id) {
+            gemma2TargetDim = targetDimension ?? null;
+            onProgress?.(100);
+            return true;
+        }
+
+        const { env, AutoProcessor, AutoModel } = await import('@huggingface/transformers');
+        env.allowLocalModels = false;
+        env.useBrowserCache = true;
+
+        console.log(`[GemmaWeb] Loading EmbeddingGemma 2: ${id}`);
+        let lastReportedProgress = 0;
+        const fileProgressMap = new Map<string, { loaded: number; total: number }>();
+
+        const handleProgress = (e: any) => {
+            if (!onProgress) return;
+            if (e.status === 'progress_total' && typeof e.progress === 'number') {
+                if (e.progress > lastReportedProgress && e.progress < 99.5) {
+                    lastReportedProgress = e.progress;
+                    onProgress(e.progress);
+                }
+                return;
+            }
+            if (e.status === 'progress' && e.file && e.total) {
+                fileProgressMap.set(e.file, { loaded: e.loaded, total: e.total });
+                let sumLoaded = 0;
+                let sumTotal = 0;
+                for (const f of fileProgressMap.values()) {
+                    sumLoaded += f.loaded;
+                    sumTotal += f.total;
+                }
+                if (sumTotal > 0) {
+                    const totalPct = (sumLoaded / sumTotal) * 100;
+                    if (totalPct > lastReportedProgress && totalPct < 99.5) {
+                        lastReportedProgress = totalPct;
+                        onProgress(totalPct);
+                    }
+                }
+            }
+        };
+
+        const modelOptions: any = {
+            dtype: 'q4',
+            device: 'webgpu',
+            progress_callback: handleProgress,
+        };
+        if (token) {
+            modelOptions.token = token;
+        }
+
+        const processorOptions: any = { progress_callback: handleProgress };
+        if (token) {
+            processorOptions.token = token;
+        }
+
+        const [processor, model] = await Promise.all([
+            AutoProcessor.from_pretrained(id, processorOptions),
+            AutoModel.from_pretrained(id, modelOptions).catch(async (webgpuErr: any) => {
+                console.warn('[GemmaWeb] WebGPU load failed for EmbeddingGemma 2, falling back to WASM:', webgpuErr);
+                const wasmOptions = { ...modelOptions, device: 'wasm' };
+                return AutoModel.from_pretrained(id, wasmOptions);
+            }),
+        ]);
+
+        gemma2Model = model;
+        gemma2Processor = processor;
+        gemma2ModelId = id;
+        gemma2TargetDim = targetDimension ?? null;
+        onProgress?.(100);
+        console.log('[GemmaWeb] EmbeddingGemma 2 initialized successfully.');
+        return true;
+    } catch (err) {
+        console.error('[GemmaWeb] initEmbeddingGemma2 failed:', err);
+        throw err;
+    }
+};
+
 /**
  * Computes a semantic embedding vector for [text].
- *
- * Pads / truncates to EMBEDDING_SEQ_LEN and applies mean-pooling when the
- * model returns a full sequence output ([1, seq, dim]) rather than a pooled
- * one ([1, dim]).
+ * Routes to EmbeddingGemma 2 if initialized, or LiteRT as fallback.
  */
 (window as any).getEmbedding = async (text: string): Promise<Float32Array> => {
+    if (gemma2Model && gemma2Processor) {
+        const inputs = await gemma2Processor(text.trim());
+        const outputs = await gemma2Model(inputs);
+        const sentence_embedding = outputs?.sentence_embedding ?? Object.values<any>(outputs)[0];
+        try {
+            const raw = sentence_embedding.data instanceof Float32Array
+                ? sentence_embedding.data
+                : Float32Array.from(sentence_embedding.tolist()[0]);
+            return _applyMatryoshka(raw, gemma2TargetDim);
+        } finally {
+            sentence_embedding?.dispose?.();
+            Object.values<any>(inputs).forEach((t: any) => t?.dispose?.());
+        }
+    }
+
     if (!tfliteModel || !tokenizer) throw new Error('[GemmaWeb] Embedder not initialised.');
 
     const { Tensor } = await import('@litertjs/core');
@@ -321,18 +452,367 @@ async function _loadEmbeddingModelBytes(
 };
 
 /**
- * Releases the compiled LiteRT model and tokenizer from memory.
- *
- * The WASM runtime itself is NOT unloaded because doing so would require a
- * full page reload. Only the compiled model graph and tokenizer are freed.
+ * Computes an embedding vector for one or more encoded images using EmbeddingGemma 2.
+ */
+(window as any).getEmbeddingFromImages = async (images: any): Promise<Float32Array> => {
+    if (!gemma2Model || !gemma2Processor) {
+        throw new Error('[GemmaWeb] EmbeddingGemma 2 not initialized.');
+    }
+    const { RawImage } = await import('@huggingface/transformers');
+
+    let imageList: any[] = [];
+    if (Array.isArray(images)) {
+        imageList = images;
+    } else if (images instanceof Uint8Array) {
+        imageList = [images];
+    } else if (images && typeof images[Symbol.iterator] === 'function') {
+        imageList = Array.from(images);
+    } else if (images && typeof images.length === 'number') {
+        imageList = Array.from(images);
+    } else if (images && typeof images === 'object') {
+        imageList = Object.values(images);
+    } else {
+        imageList = [images];
+    }
+
+    const rawImages = await Promise.all(
+        imageList.map(async (bytes) => {
+            const blob = new Blob([bytes as any]);
+            return await RawImage.fromBlob(blob);
+        })
+    );
+
+    // In EmbeddingGemma2Processor, positional signature is (text = null, images = rawImages)
+    const inputs = await gemma2Processor(null, rawImages);
+
+    const outputs = await gemma2Model(inputs);
+    const sentence_embedding = outputs?.sentence_embedding ?? Object.values<any>(outputs)[0];
+    try {
+        const raw = sentence_embedding.data instanceof Float32Array
+            ? sentence_embedding.data
+            : Float32Array.from(sentence_embedding.tolist()[0]);
+        return _applyMatryoshka(raw, gemma2TargetDim);
+    } finally {
+        sentence_embedding?.dispose?.();
+        Object.values<any>(inputs).forEach((t: any) => t?.dispose?.());
+    }
+};
+
+/**
+ * Synchronizes placeholder tokens (<|image|> or <|audio|>) in prompt text to match targetCount.
+ */
+function _syncPlaceholders(text: string, token: string, targetCount: number): string {
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escaped, 'g');
+    const matches = text.match(regex);
+    let count = matches ? matches.length : 0;
+
+    if (count < targetCount) {
+        const needed = targetCount - count;
+        text = text + (text.length > 0 ? ' ' : '') + Array(needed).fill(token).join(' ');
+    } else if (count > targetCount) {
+        let excess = count - targetCount;
+        let lastIdx = text.length;
+        while (excess > 0 && lastIdx > 0) {
+            const idx = text.lastIndexOf(token, lastIdx);
+            if (idx === -1) break;
+            text = text.substring(0, idx) + text.substring(idx + token.length);
+            lastIdx = idx;
+            excess--;
+        }
+    }
+    return text.trim();
+}
+
+/**
+ * Computes an embedding vector for interleaved multimodal parts (text, image, audio).
+ */
+(window as any).getEmbeddingFromParts = async (parts: any): Promise<Float32Array> => {
+    if (!gemma2Model || !gemma2Processor) {
+        throw new Error('[GemmaWeb] EmbeddingGemma 2 not initialized.');
+    }
+    const { RawImage } = await import('@huggingface/transformers');
+
+    let partList: any[] = [];
+    if (Array.isArray(parts)) {
+        partList = parts;
+    } else if (parts && typeof parts[Symbol.iterator] === 'function') {
+        partList = Array.from(parts);
+    } else if (parts && typeof parts.length === 'number') {
+        partList = Array.from(parts);
+    } else if (parts && typeof parts === 'object') {
+        partList = Object.values(parts);
+    } else {
+        partList = [parts];
+    }
+
+    const textSegments: string[] = [];
+    const imageParts: any[] = [];
+    const audioSegments: Float32Array[] = [];
+    let hasExplicitText = false;
+
+    for (const part of partList) {
+        if (part.type === 'text' && part.text) {
+            textSegments.push(part.text);
+            hasExplicitText = true;
+        } else if (part.type === 'image' && part.bytes) {
+            const blob = new Blob([part.bytes as any]);
+            imageParts.push(await RawImage.fromBlob(blob));
+            textSegments.push('<|image|>');
+        } else if (part.type === 'audio' && part.bytes) {
+            const int16 = new Int16Array(part.bytes.buffer, part.bytes.byteOffset, part.bytes.byteLength / 2);
+            const slice = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i++) {
+                slice[i] = int16[i] / 32768.0;
+            }
+            audioSegments.push(slice);
+            textSegments.push('<|audio|>');
+        }
+    }
+
+    let promptText: string | null = textSegments.join(' ').trim();
+    if (imageParts.length > 0) {
+        promptText = _syncPlaceholders(promptText, '<|image|>', imageParts.length);
+    }
+    if (audioSegments.length > 0) {
+        promptText = _syncPlaceholders(promptText, '<|audio|>', audioSegments.length);
+    }
+
+    // If there is no explicit text and no audio, pass null so processor builds clean image inputs
+    if (!hasExplicitText && audioSegments.length === 0 && imageParts.length > 0) {
+        promptText = null;
+    }
+
+    const audioParam = audioSegments.length === 0
+        ? null
+        : (audioSegments.length === 1 ? audioSegments[0] : [audioSegments]);
+
+    const imageParam = imageParts.length > 0 ? imageParts : null;
+
+    let inputs: any;
+    if (imageParam && audioParam) {
+        inputs = await gemma2Processor(promptText, imageParam, audioParam);
+    } else if (imageParam) {
+        inputs = await gemma2Processor(promptText, imageParam);
+    } else if (audioParam) {
+        inputs = await gemma2Processor(promptText, null, audioParam);
+    } else if (promptText) {
+        inputs = await gemma2Processor(promptText);
+    } else {
+        throw new Error('[GemmaWeb] No valid modal parts provided.');
+    }
+
+    const outputs = await gemma2Model(inputs);
+    const sentence_embedding = outputs?.sentence_embedding ?? Object.values<any>(outputs)[0];
+    try {
+        const raw = sentence_embedding.data instanceof Float32Array
+            ? sentence_embedding.data
+            : Float32Array.from(sentence_embedding.tolist()[0]);
+        return _applyMatryoshka(raw, gemma2TargetDim);
+    } finally {
+        sentence_embedding?.dispose?.();
+        Object.values<any>(inputs).forEach((t: any) => t?.dispose?.());
+    }
+};
+
+/**
+ * Returns whether audio embedding is supported.
+ */
+(window as any).supportsAudio = async (): Promise<boolean> => {
+    return true;
+};
+
+/**
+ * Video frame and metadata extraction helpers for Web.
+ */
+let _extractVideoEl: HTMLVideoElement | null = null;
+let _extractVideoSrc: string | null = null;
+
+async function _getOrLoadVideo(url: string): Promise<HTMLVideoElement> {
+    const cleanUrl = url.split('#')[0];
+    if (_extractVideoEl && _extractVideoSrc === cleanUrl && _extractVideoEl.readyState >= 1) {
+        return _extractVideoEl;
+    }
+    if (_extractVideoEl) {
+        try {
+            _extractVideoEl.pause();
+            _extractVideoEl.removeAttribute('src');
+            _extractVideoEl.load();
+        } catch (_) {}
+    }
+    const video = document.createElement('video');
+    if (!cleanUrl.startsWith('blob:') && !cleanUrl.startsWith('data:')) {
+        video.crossOrigin = 'anonymous';
+    }
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'auto';
+
+    await new Promise<void>((resolve) => {
+        let done = false;
+        const timer = setTimeout(() => {
+            if (!done) {
+                done = true;
+                cleanup();
+                resolve();
+            }
+        }, 8000);
+
+        const onLoaded = () => {
+            if (!done && video.readyState >= 1) {
+                done = true;
+                clearTimeout(timer);
+                cleanup();
+                resolve();
+            }
+        };
+        const onError = (e: any) => {
+            if (!done) {
+                done = true;
+                clearTimeout(timer);
+                cleanup();
+                console.warn('[GemmaWeb] Video load notice:', cleanUrl, e);
+                resolve();
+            }
+        };
+        const cleanup = () => {
+            video.removeEventListener('loadedmetadata', onLoaded);
+            video.removeEventListener('loadeddata', onLoaded);
+            video.removeEventListener('canplay', onLoaded);
+            video.removeEventListener('error', onError);
+        };
+
+        video.addEventListener('loadedmetadata', onLoaded);
+        video.addEventListener('loadeddata', onLoaded);
+        video.addEventListener('canplay', onLoaded);
+        video.addEventListener('error', onError);
+        video.src = cleanUrl;
+        video.load();
+
+        if (video.readyState >= 1) {
+            done = true;
+            clearTimeout(timer);
+            cleanup();
+            resolve();
+        }
+    });
+
+    _extractVideoEl = video;
+    _extractVideoSrc = cleanUrl;
+    return video;
+}
+
+(window as any).extractVideoMetadata = async (
+    videoUrl: string
+): Promise<{ durationMs: number; width: number; height: number } | null> => {
+    try {
+        const video = await _getOrLoadVideo(videoUrl);
+        if (video.readyState < 1) {
+            await new Promise<void>((resolve) => {
+                const onMeta = () => {
+                    video.removeEventListener('loadedmetadata', onMeta);
+                    resolve();
+                };
+                video.addEventListener('loadedmetadata', onMeta);
+                setTimeout(resolve, 3000);
+            });
+        }
+        const durationSec = isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+        return {
+            durationMs: Math.round(durationSec * 1000),
+            width: video.videoWidth || 640,
+            height: video.videoHeight || 360,
+        };
+    } catch (err) {
+        console.warn('[GemmaWeb] extractVideoMetadata error:', err);
+        return null;
+    }
+};
+
+(window as any).extractVideoFrame = async (
+    videoUrl: string,
+    timeMs: number
+): Promise<Uint8Array | null> => {
+    try {
+        const video = await _getOrLoadVideo(videoUrl);
+        if (video.readyState < 1) {
+            await new Promise<void>((resolve) => {
+                const onMeta = () => {
+                    video.removeEventListener('loadedmetadata', onMeta);
+                    resolve();
+                };
+                video.addEventListener('loadedmetadata', onMeta);
+                setTimeout(resolve, 3000);
+            });
+        }
+        const maxSec = isFinite(video.duration) && video.duration > 0 ? video.duration : (timeMs / 1000);
+        const targetSec = Math.max(0, Math.min(timeMs / 1000, maxSec));
+
+        if (Math.abs(video.currentTime - targetSec) > 0.05) {
+            await new Promise<void>((resolve) => {
+                let resolved = false;
+                const timer = setTimeout(() => {
+                    if (!resolved) {
+                        resolved = true;
+                        video.removeEventListener('seeked', onSeeked);
+                        resolve();
+                    }
+                }, 3000);
+
+                const onSeeked = () => {
+                    if (!resolved) {
+                        resolved = true;
+                        clearTimeout(timer);
+                        video.removeEventListener('seeked', onSeeked);
+                        resolve();
+                    }
+                };
+                video.addEventListener('seeked', onSeeked);
+                video.currentTime = targetSec;
+            });
+        }
+
+        const width = video.videoWidth > 0 ? video.videoWidth : 640;
+        const height = video.videoHeight > 0 ? video.videoHeight : 360;
+        const targetWidth = Math.min(640, width);
+        const targetHeight = Math.max(1, Math.round(targetWidth * (height / width)));
+
+        const canvas = document.createElement('canvas');
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return null;
+
+        ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        const commaIdx = dataUrl.indexOf(',');
+        if (commaIdx === -1) return null;
+        const base64 = dataUrl.substring(commaIdx + 1);
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+    } catch (err) {
+        console.warn('[GemmaWeb] extractVideoFrame error at', timeMs, 'ms:', err);
+        return null;
+    }
+};
+
+/**
+ * Releases all embedding models (both LiteRT and EmbeddingGemma 2) and tokenizer from memory.
  */
 (window as any).unloadEmbeddingModel = (): void => {
     _releaseCompiledModel();
-    // Note: tokenizer is kept alive because it's cheap and reloading it
-    // requires a network round-trip on first use. Set to null if you want
-    // it fully released.
     tokenizer = null;
-    console.log('[GemmaWeb] Embedding model unloaded.');
+    try { gemma2Model?.dispose?.(); } catch (_) {}
+    gemma2Model = null;
+    gemma2Processor = null;
+    gemma2ModelId = null;
+    gemma2TargetDim = null;
+    console.log('[GemmaWeb] Embedding models unloaded.');
 };
 
 /** Internal helper: nulls the compiled model without touching the runtime. */
@@ -358,12 +838,18 @@ function _meanPool(output: Float32Array, mask: any, dim: number): Float32Array {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. Hybrid Web LLM Engine (LiteRT-LM & MediaPipe Tasks GenAI)
+// 3. Hybrid Web LLM Engine (Gemma 4 ONNX, LiteRT-LM & MediaPipe Tasks GenAI)
 // ─────────────────────────────────────────────────────────────────────────────
 
 let engine: any = null;
 let conversation: any = null;
 let llmInstance: any = null;
+
+// Gemma 4 ONNX (Transformers.js + WebGPU)
+let onnxModel: any = null;
+let onnxProcessor: any = null;
+let onnxModelId: string | null = null;
+let onnxStoppingCriteria: any = null;
 
 /**
  * Loads and initialises the appropriate LLM engine based on model type.
@@ -380,6 +866,90 @@ let llmInstance: any = null;
         await _releaseLlmInstance();
 
         const modelPath = options?.baseOptions?.modelPath ?? options?.modelPath;
+        const modelPathStr = String(modelPath || '').toLowerCase();
+        const isOnnx = options?.isOnnx === true ||
+                       options?.format === 'onnx' ||
+                       modelPathStr.endsWith('.onnx') ||
+                       modelPathStr.includes('.onnx') ||
+                       modelPathStr.includes('onnx-community') ||
+                       (modelPathStr.includes('onnx') && !modelPathStr.includes('litertlm') && !modelPathStr.includes('.task'));
+
+        if (isOnnx) {
+            const isE4B = modelPathStr.includes('e4b') || modelPathStr.includes('4b');
+            let modelId = isE4B ? 'onnx-community/gemma-4-E4B-it-ONNX' : 'onnx-community/gemma-4-E2B-it-ONNX';
+            if (modelPath && modelPath.includes('onnx-community/') && !modelPath.includes('http') && !modelPath.includes('blob:')) {
+                modelId = modelPath;
+            }
+
+            if (onnxModel && onnxProcessor && onnxModelId === modelId) {
+                options?.onProgress?.(100);
+                return true;
+            }
+
+            console.log(`[GemmaWeb] Loading Gemma 4 ONNX Engine (${modelId})...`);
+            const { AutoProcessor, Gemma4ForConditionalGeneration, env } = await import('@huggingface/transformers');
+            env.allowLocalModels = false;
+            env.useBrowserCache = true;
+
+            let lastReportedProgress = 0;
+            const fileProgressMap = new Map<string, { loaded: number; total: number }>();
+            const handleProgress = (e: any) => {
+                if (options?.onProgress && typeof options.onProgress === 'function') {
+                    if (e.status === 'progress_total' && typeof e.progress === 'number') {
+                        if (e.progress > lastReportedProgress && e.progress < 99.5) {
+                            lastReportedProgress = e.progress;
+                            options.onProgress(e.progress);
+                        }
+                    } else if (e.status === 'progress' && e.file && e.total) {
+                        fileProgressMap.set(e.file, { loaded: e.loaded, total: e.total });
+                        let sumLoaded = 0;
+                        let sumTotal = 0;
+                        for (const f of fileProgressMap.values()) {
+                            sumLoaded += f.loaded;
+                            sumTotal += f.total;
+                        }
+                        if (sumTotal > 0) {
+                            const totalPct = (sumLoaded / sumTotal) * 100;
+                            if (totalPct > lastReportedProgress && totalPct < 99.5) {
+                                lastReportedProgress = totalPct;
+                                options.onProgress(totalPct);
+                            }
+                        }
+                    }
+                }
+            };
+
+            const modelOptions: any = {
+                dtype: 'q4f16',
+                device: 'webgpu',
+                progress_callback: handleProgress,
+            };
+            if (options?.token) {
+                modelOptions.token = options.token;
+            }
+
+            const processorOptions: any = { progress_callback: handleProgress };
+            if (options?.token) {
+                processorOptions.token = options.token;
+            }
+
+            const [processor, model] = await Promise.all([
+                AutoProcessor.from_pretrained(modelId, processorOptions),
+                Gemma4ForConditionalGeneration.from_pretrained(modelId, modelOptions).catch(async (webgpuErr: any) => {
+                    console.warn('[GemmaWeb] WebGPU load failed for Gemma 4 ONNX, falling back to WASM / q4:', webgpuErr);
+                    const wasmOptions = { ...modelOptions, dtype: 'q4', device: 'wasm' };
+                    return Gemma4ForConditionalGeneration.from_pretrained(modelId, wasmOptions);
+                }),
+            ]);
+
+            onnxModel = model;
+            onnxProcessor = processor;
+            onnxModelId = modelId;
+            options?.onProgress?.(100);
+            console.log(`[GemmaWeb] Gemma 4 ONNX Engine ready (${modelId}).`);
+            return true;
+        }
+
         const isTaskModel = modelPath?.endsWith('.task') || modelPath?.endsWith('.bin');
         // Force MediaPipe if the file is a .task model, even for Gemma 4
         const isGemma4 = options?.isGemma4 === true && !isTaskModel;
@@ -425,8 +995,174 @@ let llmInstance: any = null;
     parts: any[],
     callback: (partial: string, done: boolean) => void,
 ): void => {
+    if (onnxModel && onnxProcessor) {
+        // Gemma 4 ONNX path (Transformers.js + WebGPU)
+        let isCancelled = false;
+        activeGeneration = {
+            cancel: () => {
+                isCancelled = true;
+                onnxStoppingCriteria?.interrupt?.();
+            },
+        };
+
+        (async () => {
+            try {
+                const { RawImage, read_audio, TextStreamer, InterruptableStoppingCriteria } = await import('@huggingface/transformers');
+                const stoppingCriteria = new InterruptableStoppingCriteria();
+                onnxStoppingCriteria = stoppingCriteria;
+
+                const textSegments: string[] = [];
+                const images: any[] = [];
+                const audios: any[] = [];
+
+                for (const p of parts) {
+                    if (typeof p === 'string') {
+                        textSegments.push(p);
+                    } else if (p && p.imageSource) {
+                        const src = p.imageSource;
+                        if (typeof src === 'string' && src.startsWith('data:')) {
+                            const res = await fetch(src);
+                            const blob = await res.blob();
+                            images.push(await RawImage.fromBlob(blob));
+                        } else {
+                            images.push(await RawImage.read(src));
+                        }
+                    } else if (p && p.audioSource) {
+                        audios.push(await read_audio(p.audioSource, 16000));
+                    } else if (p && p.bytes) {
+                        if (p.type === 'image') {
+                            images.push(await RawImage.fromBlob(new Blob([p.bytes])));
+                        } else if (p.type === 'audio') {
+                            const blob = new Blob([p.bytes], { type: 'audio/wav' });
+                            const url = URL.createObjectURL(blob);
+                            try {
+                                audios.push(await read_audio(url, 16000));
+                            } finally {
+                                URL.revokeObjectURL(url);
+                            }
+                        }
+                    } else if (p && p.text) {
+                        textSegments.push(p.text);
+                    } else if (p != null) {
+                        textSegments.push(String(p));
+                    }
+                }
+
+                const fullText = textSegments.join(' ').trim();
+                let prompt = '';
+
+                if (fullText.includes('<start_of_turn>') || fullText.includes('<|turn>')) {
+                    prompt = fullText
+                        .replaceAll('<start_of_turn>', '<|turn>')
+                        .replaceAll('<end_of_turn>', '<turn|>');
+                    if (!prompt.startsWith('<bos>')) {
+                        prompt = '<bos>' + prompt;
+                    }
+                    if (images.length > 0 && !prompt.includes('<|image|>')) {
+                        const imageTokens = Array(images.length).fill('<|image|>').join('');
+                        const lastUserIdx = prompt.lastIndexOf('<|turn>user\n');
+                        if (lastUserIdx !== -1) {
+                            prompt = prompt.substring(0, lastUserIdx + 12) + imageTokens + prompt.substring(lastUserIdx + 12);
+                        } else {
+                            prompt = prompt.replace('<|turn>user\n', `<|turn>user\n${imageTokens}`);
+                        }
+                    }
+                    if (audios.length > 0 && !prompt.includes('<|audio|>')) {
+                        const audioTokens = Array(audios.length).fill('<|audio|>').join('');
+                        const lastUserIdx = prompt.lastIndexOf('<|turn>user\n');
+                        if (lastUserIdx !== -1) {
+                            prompt = prompt.substring(0, lastUserIdx + 12) + audioTokens + prompt.substring(lastUserIdx + 12);
+                        } else {
+                            prompt = prompt.replace('<|turn>user\n', `<|turn>user\n${audioTokens}`);
+                        }
+                    }
+                } else {
+                    const content: any[] = [];
+                    for (let i = 0; i < images.length; i++) content.push({ type: 'image' });
+                    for (let i = 0; i < audios.length; i++) content.push({ type: 'audio' });
+                    if (fullText) content.push({ type: 'text', text: fullText });
+
+                    const messages = [{ role: 'user', content }];
+                    prompt = onnxProcessor.apply_chat_template(messages, {
+                        enable_thinking: fullText.includes('<|think|>'),
+                        add_generation_prompt: true,
+                    });
+                }
+
+                // Ensure multimodal tokens match count exactly
+                if (images.length > 0) {
+                    const count = (prompt.match(/<\|image\|>/g) || []).length;
+                    if (count < images.length) {
+                        const needed = images.length - count;
+                        const imageTokens = Array(needed).fill('<|image|>').join('');
+                        const lastUserIdx = prompt.lastIndexOf('<|turn>user\n');
+                        if (lastUserIdx !== -1) {
+                            prompt = prompt.substring(0, lastUserIdx + 12) + imageTokens + prompt.substring(lastUserIdx + 12);
+                        } else {
+                            prompt = imageTokens + prompt;
+                        }
+                    }
+                }
+                if (audios.length > 0) {
+                    const count = (prompt.match(/<\|audio\|>/g) || []).length;
+                    if (count < audios.length) {
+                        const needed = audios.length - count;
+                        const audioTokens = Array(needed).fill('<|audio|>').join('');
+                        const lastUserIdx = prompt.lastIndexOf('<|turn>user\n');
+                        if (lastUserIdx !== -1) {
+                            prompt = prompt.substring(0, lastUserIdx + 12) + audioTokens + prompt.substring(lastUserIdx + 12);
+                        } else {
+                            prompt = audioTokens + prompt;
+                        }
+                    }
+                }
+
+                const imageParam = images.length === 0 ? null : (images.length === 1 ? images[0] : images);
+                const audioParam = audios.length === 0 ? null : (audios.length === 1 ? audios[0] : audios);
+
+                const inputs = await onnxProcessor(prompt, imageParam, audioParam, {
+                    add_special_tokens: false,
+                });
+
+                if (isCancelled) return;
+
+                const streamer = new TextStreamer(onnxProcessor.tokenizer, {
+                    skip_prompt: true,
+                    skip_special_tokens: false,
+                    callback_function: (chunk: string) => {
+                        if (!isCancelled) {
+                            const cleanChunk = chunk.replaceAll('<turn|>', '').replaceAll('<end_of_turn>', '');
+                            if (cleanChunk.length > 0) {
+                                callback(cleanChunk, false);
+                            }
+                        }
+                    },
+                });
+
+                await onnxModel.generate({
+                    ...inputs,
+                    max_new_tokens: 1024,
+                    do_sample: false,
+                    streamer,
+                    stopping_criteria: stoppingCriteria,
+                });
+
+            } catch (err: any) {
+                if (!String(err).includes('cancel') && !isCancelled) {
+                    console.error('[GemmaWeb] generateResponse ONNX error:', err);
+                }
+            } finally {
+                activeGeneration = null;
+                onnxStoppingCriteria = null;
+                if (!isCancelled) {
+                    callback('', true);
+                }
+            }
+        })();
+        return;
+    }
+
     if (engine && conversation) {
-        // LiteRT-LM path
         // LiteRT-LM path
         const contentItems = parts.map(p => {
             if (typeof p === 'string') {
@@ -494,6 +1230,7 @@ let llmInstance: any = null;
             if (!String(err).includes('cancel')) {
                 console.error('[GemmaWeb] generateResponse error:', err);
             }
+            callback('', true);
         }).finally(() => {
             activeGeneration = null;
         });
@@ -517,6 +1254,8 @@ let llmInstance: any = null;
     activeGeneration = null;
 
     await _releaseLlmInstance();
+    // Allow browser WebGPU context & garbage collection to cleanly reclaim pipeline resources
+    await new Promise((resolve) => setTimeout(resolve, 150));
     console.log('[GemmaWeb] LLM unloaded.');
 };
 
@@ -530,9 +1269,16 @@ async function _releaseLlmInstance(): Promise<void> {
         if (llmInstance) {
             llmInstance.close();
         }
+        if (onnxModel) {
+            await onnxModel.dispose?.();
+        }
     } catch { /* ignore */ }
     engine = null;
     llmInstance = null;
+    onnxModel = null;
+    onnxProcessor = null;
+    onnxModelId = null;
+    onnxStoppingCriteria = null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -545,6 +1291,10 @@ async function _releaseLlmInstance(): Promise<void> {
  */
 (window as any).countTokens = async (text: string): Promise<number> => {
     try {
+        if (onnxProcessor?.tokenizer) {
+            const encoded = await onnxProcessor.tokenizer(text);
+            return (encoded.input_ids?.data?.length ?? encoded.input_ids?.length) as number;
+        }
         if (!tokenizer) {
             const { AutoTokenizer, env } = await import('@huggingface/transformers');
             env.allowLocalModels = false;
@@ -942,4 +1692,50 @@ async function _releaseLlmInstance(): Promise<void> {
             };
         }
     });
+};
+
+/**
+ * Checks whether an ONNX model matching [pattern] is present in browser Cache Storage.
+ */
+(window as any).isTransformersModelCached = async (pattern: string): Promise<boolean> => {
+    if (!('caches' in window)) return false;
+    try {
+        const cacheNames = await caches.keys();
+        for (const name of cacheNames) {
+            const cache = await caches.open(name);
+            const reqs = await cache.keys();
+            for (const req of reqs) {
+                if (req.url.toLowerCase().includes(pattern.toLowerCase())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    } catch (_) {
+        return false;
+    }
+};
+
+/**
+ * Deletes cached model entries matching [pattern] from browser Cache Storage.
+ */
+(window as any).deleteTransformersModel = async (pattern: string): Promise<boolean> => {
+    if (!('caches' in window)) return false;
+    try {
+        const cacheNames = await caches.keys();
+        let deletedAny = false;
+        for (const name of cacheNames) {
+            const cache = await caches.open(name);
+            const reqs = await cache.keys();
+            for (const req of reqs) {
+                if (req.url.toLowerCase().includes(pattern.toLowerCase())) {
+                    const ok = await cache.delete(req);
+                    if (ok) deletedAny = true;
+                }
+            }
+        }
+        return deletedAny;
+    } catch (_) {
+        return false;
+    }
 };

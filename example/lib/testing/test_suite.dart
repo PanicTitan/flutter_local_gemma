@@ -17,6 +17,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_local_gemma/flutter_local_gemma.dart';
 import 'package:flutter_local_gemma/helpers/model_loader.dart';
+import '../app_state.dart';
 
 const _hfToken = 'hf_YOUR_TOKEN_HERE';
 
@@ -57,11 +58,18 @@ class TestSuiteContext {
   String? embedPath;
   String? tokenizerPath;
 
+  /// Human-readable detail string set by tests to display in the UI.
+  String? detail;
+
   /// Live download-progress value [0–100], updated during download tests.
   double downloadProgress = 0;
 
   /// Optional callback so the screen can redraw during progress ticks.
   void Function(double)? onProgress;
+
+  /// When true (e.g. during [runAll]), cache purge test is skipped to prevent
+  /// wiping the downloaded models. Tap Run on the test individually to execute.
+  bool skipCachePurgeOnRunAll = false;
 
   // ── Asset loaders (lazy, cached after first load) ─────────────────────────
 
@@ -121,6 +129,7 @@ class TestSuite {
   /// Runs every pending test in order.
   Future<void> runAll() async {
     isRunning = true;
+    ctx.skipCachePurgeOnRunAll = true;
     onUpdate();
     for (final tc in cases) {
       if (tc.status != TestStatus.pending) continue;
@@ -133,6 +142,9 @@ class TestSuite {
   /// Re-runs a single test (resets it to pending first).
   Future<void> runOne(TestCase tc) async {
     tc.status = TestStatus.pending;
+    if (tc.id == 'cache_purge') {
+      ctx.skipCachePurgeOnRunAll = false;
+    }
     onUpdate();
     await _run(tc);
   }
@@ -148,21 +160,52 @@ class TestSuite {
       // Auto-initialize LLM if running out of order.
       // If the engine is ALREADY initialized (user loaded a model via the UI),
       // we reuse it instead of downloading — this lets you test any model.
-      if (tc.id.startsWith('llm_') == false && tc.id != 'llm_download' && tc.id != 'llm_init') {
+      if (tc.id.startsWith('llm_') && tc.id != 'llm_download' && tc.id != 'llm_init') {
         if (!FlutterLocalGemma().isInitialized) {
-          // Engine not running — try download fallback
-          ctx.llmPath = await PluginModelLoader.downloadLlm(token: _hfToken);
-          if (ctx.llmPath != null) {
-            await PluginModelLoader.initLlm(path: ctx.llmPath!);
+          final path = ctx.llmPath ??
+              ModelManager.instance.llmModelPath ??
+              FlutterLocalGemma().currentModelPath;
+          if (path != null) {
+            await PluginModelLoader.initLlm(path: path, enableMtp: true);
+          } else {
+            throw _SkipException('Gemma engine is not initialized. Run llm_download/llm_init or load a model from the Models tab.');
           }
-        } else {
-          // Engine already running — just make sure ctx has the path
-          // so tests that need it (e.g. llm_reload) can use it.
-          ctx.llmPath ??= FlutterLocalGemma().currentModelPath;
         }
+        ctx.llmPath ??= FlutterLocalGemma().currentModelPath;
       }
-      
+
+      // Auto-initialize Embedding if running out of order.
+      if (tc.id.startsWith('embed_') &&
+          tc.id != 'embed_download' &&
+          tc.id != 'embed_init' &&
+          tc.id != 'embed_gemma2_init' &&
+          tc.id != 'embed_unload') {
+        if (!EmbeddingPlugin().isInitialized) {
+          final path = ctx.embedPath ??
+              ModelManager.instance.embeddingModelPath ??
+              EmbeddingPlugin().activeConfig?.modelPathOrId;
+          if (path != null) {
+            final isLegacyTflite = path.endsWith('.tflite');
+            if (isLegacyTflite) {
+              await PluginModelLoader.initEmbedding(
+                modelPath: path,
+                tokenizerPath: ctx.tokenizerPath,
+              );
+            } else {
+              await PluginModelLoader.initEmbeddingGemma2(
+                modelPathOrId: path,
+              );
+            }
+          } else {
+            throw _SkipException('Embedding engine is not initialized. Run embed_download/embed_init first.');
+          }
+        }
+        ctx.embedPath ??= EmbeddingPlugin().activeConfig?.modelPathOrId;
+      }
+
+      ctx.detail = null;
       await tc.run(ctx);
+      tc.detail ??= ctx.detail;
       tc.duration = DateTime.now().difference(start);
       tc.status = TestStatus.passed;
     } on _SkipException catch (e) {
@@ -210,22 +253,33 @@ class TestSuite {
     TestCase(
       id: 'llm_download',
       name: 'LLM — Download model',
-      description: 'Downloads Gemma from HuggingFace to the platform cache.',
+      description: 'Downloads Gemma 4 2B (open, no token needed) if not loaded.',
       run: (ctx) async {
         if (FlutterLocalGemma().isInitialized) {
           ctx.llmPath = FlutterLocalGemma().currentModelPath;
-          throw _SkipException('Engine already loaded. Using current model for tests.');
+          ctx.detail = 'Already loaded (${ctx.llmPath?.split('/').last})';
+          return;
         }
+
+        final gemma4 = GemmaModel.gemma4E2B;
+        final downloadUrl = kIsWeb ? gemma4.webUrl : gemma4.androidUrl;
+        final token = ModelManager.instance.hfToken ??
+            (_hfToken.contains('YOUR_TOKEN') ? null : _hfToken);
+
         ctx.llmPath = await PluginModelLoader.downloadLlm(
-          token: _hfToken,
+          networkUrl: downloadUrl,
+          token: token,
           onProgress: (p) {
             ctx.downloadProgress = p;
             ctx.onProgress?.call(p);
           },
         );
+
         if (ctx.llmPath == null || ctx.llmPath!.isEmpty) {
           throw Exception('Returned model path is empty');
         }
+        ModelManager.instance.llmModelPath = ctx.llmPath;
+        ctx.detail = 'Gemma 4 2B ready: ${ctx.llmPath!.split('/').last}';
       },
     ),
 
@@ -235,13 +289,28 @@ class TestSuite {
       description: 'Initialises the Gemma engine from the cached model.',
       run: (ctx) async {
         if (FlutterLocalGemma().isInitialized) {
-          throw _SkipException('Engine already initialized. Skipping.');
+          ctx.llmPath ??= FlutterLocalGemma().currentModelPath;
+          ctx.detail = 'Already initialized (${ctx.llmPath?.split('/').last})';
+          return;
         }
-        if (ctx.llmPath == null) throw Exception('Run llm_download first');
-        await PluginModelLoader.initLlm(path: ctx.llmPath!);
+
+        ctx.llmPath ??= ModelManager.instance.llmModelPath;
+        if (ctx.llmPath == null) {
+          final gemma4 = GemmaModel.gemma4E2B;
+          ctx.llmPath = await PluginModelLoader.downloadLlm(
+            networkUrl: kIsWeb ? gemma4.webUrl : gemma4.androidUrl,
+          );
+        }
+
+        await PluginModelLoader.initLlm(
+          path: ctx.llmPath!,
+          enableMtp: true,
+          modelName: ctx.llmPath!.split('#').last.split('/').last,
+        );
         if (!FlutterLocalGemma().isInitialized) {
           throw Exception('isInitialized is still false after init()');
         }
+        ctx.detail = 'Initialized ${ctx.llmPath!.split('/').last}';
       },
     ),
 
@@ -360,9 +429,8 @@ class TestSuite {
       name: 'LLM — Inference with image',
       description: 'Passes test/test.png to the model; expects a reply.',
       run: (ctx) async {
-        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
-        if (kIsWeb && isGemma4) {
-          throw _SkipException('Skipping on Web because Gemma 4 does not support images.');
+        if (!FlutterLocalGemma().currentModelSupportsVision) {
+          throw _SkipException('Skipping because this model does not support images.');
         }
 
         final imgBytes = await ctx.imageBytes;
@@ -392,9 +460,8 @@ class TestSuite {
       name: 'LLM — Inference with audio',
       description: 'Passes test/test.wav to the model; expects a reply.',
       run: (ctx) async {
-        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
-        if (kIsWeb && isGemma4) {
-          throw _SkipException('Skipping on Web because Gemma 4 does not support audio.');
+        if (!FlutterLocalGemma().currentModelSupportsAudio) {
+          throw _SkipException('Skipping because this model does not support audio.');
         }
 
         final audBytes = await ctx.audioBytes;
@@ -422,9 +489,8 @@ class TestSuite {
       name: 'LLM — Inference with PDF',
       description: 'Extracts content from a PDF and sends it to the LLM.',
       run: (ctx) async {
-        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
-        if (kIsWeb && isGemma4) {
-          throw _SkipException('Skipping on Web because Gemma 4 does not support multimodality (which this PDF test uses).');
+        if (!FlutterLocalGemma().currentModelSupportsVision) {
+          throw _SkipException('Skipping because this model does not support multimodality (which this PDF test uses).');
         }
 
         final pdfData = await ctx.pdfBytes;
@@ -1072,16 +1138,29 @@ class TestSuite {
         if (ctx.llmPath == null) {
           throw Exception('llmPath is null — run llm_download first');
         }
-        await PluginModelLoader.initLlm(path: ctx.llmPath!);
+        // Yield to allow WebGPU/WASM pipeline teardown to complete cleanly
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        await PluginModelLoader.initLlm(path: ctx.llmPath!, enableMtp: true);
         if (!FlutterLocalGemma().isInitialized) {
           throw Exception('Reload: isInitialized is false');
         }
+        // Allow newly created WebGPU instance to settle
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        final isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
+        final prompt = (kIsWeb && isGemma4)
+            ? '<start_of_turn>user\n$_shortPrompt<end_of_turn>\n<start_of_turn>model\n'
+            : _shortPrompt;
         final reply = await SingleTurnChat(
           config: SessionConfig(),
-        ).generate(_shortPrompt);
+        ).generate(prompt);
         if (reply.trim().isEmpty)
           throw Exception('Empty reply after warm reload');
+        ctx.detail = reply;
         debugPrint('[llm_reload] reply: $reply');
+
+        // Unload LLM immediately after testing warm reload so device memory
+        // is 100% free for subsequent Embedding model tests
+        await PluginModelLoader.unloadLlm();
       },
     ),
 
@@ -1089,37 +1168,78 @@ class TestSuite {
     TestCase(
       id: 'embed_download',
       name: 'Embedding — Download model',
-      description: 'Downloads the embedding model (+ tokenizer on Android).',
+      description: 'Downloads EmbeddingGemma 2 (open, no token required).',
       run: (ctx) async {
-        final result = await PluginModelLoader.downloadEmbedding(
-          token: _hfToken,
+        // Free GPU resources by unloading LLM if still present
+        if (FlutterLocalGemma().isInitialized) {
+          await PluginModelLoader.unloadLlm();
+        }
+
+        if (EmbeddingPlugin().isInitialized) {
+          ctx.embedPath = EmbeddingPlugin().activeConfig?.modelPathOrId;
+          ctx.detail = 'Already active (${ctx.embedPath?.split('/').last})';
+          return;
+        }
+
+        final token = ModelManager.instance.hfToken ??
+            (_hfToken.contains('YOUR_TOKEN') ? null : _hfToken);
+
+        final path = await PluginModelLoader.downloadEmbeddingGemma2(
+          token: token,
+          preferChipsetVariant: false,
           onProgress: (p) {
             ctx.downloadProgress = p;
             ctx.onProgress?.call(p);
           },
         );
-        ctx.embedPath = result.modelPath;
-        ctx.tokenizerPath = result.tokenizerPath;
+        ctx.embedPath = path;
+        ModelManager.instance.embeddingModelPath = path;
         if (ctx.embedPath == null || ctx.embedPath!.isEmpty) {
           throw Exception('Embed model path is empty');
         }
+        ctx.detail = 'Ready: ${path.split('/').last}';
       },
     ),
 
     TestCase(
       id: 'embed_init',
       name: 'Embedding — Init engine',
-      description: 'Initialises EmbeddingPlugin from the cached model.',
+      description: 'Initialises EmbeddingPlugin from the downloaded model.',
       run: (ctx) async {
-        if (ctx.embedPath == null) throw Exception('Run embed_download first');
-        await PluginModelLoader.initEmbedding(
-          modelPath: ctx.embedPath!,
-          tokenizerPath: ctx.tokenizerPath,
-          token: _hfToken,
-        );
+        if (FlutterLocalGemma().isInitialized) {
+          await PluginModelLoader.unloadLlm();
+        }
+
+        if (EmbeddingPlugin().isInitialized) {
+          ctx.detail = 'Already initialized';
+          return;
+        }
+
+        ctx.embedPath ??= ModelManager.instance.embeddingModelPath ??
+            EmbeddingPlugin().activeConfig?.modelPathOrId;
+
+        if (ctx.embedPath == null) {
+          ctx.embedPath = await PluginModelLoader.downloadEmbeddingGemma2(
+            preferChipsetVariant: false,
+          );
+        }
+
+        final isLegacyTflite = ctx.embedPath!.endsWith('.tflite');
+        if (isLegacyTflite) {
+          await PluginModelLoader.initEmbedding(
+            modelPath: ctx.embedPath!,
+            tokenizerPath: ctx.tokenizerPath,
+          );
+        } else {
+          await PluginModelLoader.initEmbeddingGemma2(
+            modelPathOrId: ctx.embedPath!,
+          );
+        }
+
         if (!EmbeddingPlugin().isInitialized) {
           throw Exception('isInitialized is false after init()');
         }
+        ctx.detail = 'Initialized ${ctx.embedPath!.split('/').last}';
       },
     ),
 
@@ -1128,6 +1248,9 @@ class TestSuite {
       name: 'Embedding — Generate vector',
       description: 'getEmbedding() returns a non-zero float vector.',
       run: (ctx) async {
+        if (!EmbeddingPlugin().isInitialized) {
+          throw _SkipException('Embedding engine not initialized. Run embed_download/init first.');
+        }
         final vec = await EmbeddingPlugin().getEmbedding('Hello, world!');
         if (vec.isEmpty) throw Exception('Vector is empty');
         if (vec.every((v) => v == 0.0)) throw Exception('Vector is all zeros');
@@ -1143,14 +1266,23 @@ class TestSuite {
       name: 'Embedding — Cosine similarity',
       description: 'Similar sentences score higher than unrelated ones.',
       run: (ctx) async {
+        if (!EmbeddingPlugin().isInitialized) {
+          throw _SkipException('Embedding engine not initialized. Run embed_download/init first.');
+        }
+        final isGemma2 = EmbeddingPlugin().activeConfig?.isEmbeddingGemma2 ?? false;
+        final taskType = isGemma2 ? EmbeddingTaskType.sentenceSimilarity : EmbeddingTaskType.none;
+
         final vA = await EmbeddingPlugin().getEmbedding(
           'The cat sat on the mat.',
+          taskType: taskType,
         );
         final vB = await EmbeddingPlugin().getEmbedding(
           'A feline rested on a rug.',
+          taskType: taskType,
         );
         final vC = await EmbeddingPlugin().getEmbedding(
           'Stock market crash today.',
+          taskType: taskType,
         );
 
         final simAB = _cosine(vA, vB);
@@ -1175,6 +1307,13 @@ class TestSuite {
       name: 'Embedding — Semantic search (top-1)',
       description: 'Selects the most relevant sentence from a corpus.',
       run: (ctx) async {
+        if (!EmbeddingPlugin().isInitialized) {
+          throw _SkipException('Embedding engine not initialized. Run embed_download/init first.');
+        }
+        final isGemma2 = EmbeddingPlugin().activeConfig?.isEmbeddingGemma2 ?? false;
+        final qType = isGemma2 ? EmbeddingTaskType.retrievalQuery : EmbeddingTaskType.none;
+        final dType = isGemma2 ? EmbeddingTaskType.retrievalDocument : EmbeddingTaskType.none;
+
         final corpus = [
           'Flutter is a UI toolkit from Google.',
           'The Eiffel Tower is located in Paris, France.',
@@ -1182,10 +1321,10 @@ class TestSuite {
         ];
         const query = 'What is Flutter used for?';
 
-        final qVec = await EmbeddingPlugin().getEmbedding(query);
+        final qVec = await EmbeddingPlugin().getEmbedding(query, taskType: qType);
         final scores = <double>[];
         for (final s in corpus) {
-          scores.add(_cosine(qVec, await EmbeddingPlugin().getEmbedding(s)));
+          scores.add(_cosine(qVec, await EmbeddingPlugin().getEmbedding(s, taskType: dType)));
         }
 
         final best = scores.indexOf(scores.reduce(max));
@@ -1203,6 +1342,218 @@ class TestSuite {
       },
     ),
 
+    // ── EmbeddingGemma 2 Multimodal Tests ──
+    TestCase(
+      id: 'embed_gemma2_init',
+      name: 'EmbeddingGemma 2 — Init engine',
+      description: 'Initialises EmbeddingGemma 2 multimodal engine from available path.',
+      run: (ctx) async {
+        if (FlutterLocalGemma().isInitialized) {
+          await PluginModelLoader.unloadLlm();
+        }
+
+        if (EmbeddingPlugin().isInitialized &&
+            EmbeddingPlugin().activeConfig?.isEmbeddingGemma2 == true) {
+          ctx.detail = 'Already active';
+          return;
+        }
+        final path = ctx.embedPath ??
+            ModelManager.instance.embeddingModelPath ??
+            EmbeddingPlugin().activeConfig?.modelPathOrId;
+        if (path == null) {
+          ctx.embedPath = await PluginModelLoader.downloadEmbeddingGemma2(
+            preferChipsetVariant: false,
+          );
+        }
+        final finalPath = ctx.embedPath ?? path!;
+        await PluginModelLoader.initEmbeddingGemma2(modelPathOrId: finalPath);
+        if (!EmbeddingPlugin().isInitialized) {
+          throw Exception('EmbeddingPlugin failed to initialize EmbeddingGemma 2');
+        }
+        ctx.detail = 'Loaded ${finalPath.split('/').last}';
+      },
+    ),
+    TestCase(
+      id: 'embed_gemma2_task_instructions',
+      name: 'EmbeddingGemma 2 — Task instructions',
+      description: 'Formats asymmetric queries and documents with correct task prompt prefixes.',
+      run: (ctx) async {
+        final queryPrompt = formatEmbeddingText('quantum physics', taskType: EmbeddingTaskType.retrievalQuery);
+        final docPrompt = formatEmbeddingText('Quantum theory models subatomic particles.', taskType: EmbeddingTaskType.retrievalDocument, title: 'Physics');
+        if (!queryPrompt.startsWith('task: search result | query:')) {
+          throw Exception('Query prompt missing prefix: $queryPrompt');
+        }
+        if (!docPrompt.startsWith('title: Physics | text:')) {
+          throw Exception('Document prompt missing prefix: $docPrompt');
+        }
+        final qVec = await EmbeddingPlugin().getEmbedding('quantum physics', taskType: EmbeddingTaskType.retrievalQuery);
+        final dVec = await EmbeddingPlugin().getEmbedding('Quantum theory models subatomic particles.', taskType: EmbeddingTaskType.retrievalDocument, title: 'Physics');
+        if (qVec.isEmpty || dVec.isEmpty) throw Exception('Vector output is empty');
+        ctx.detail = 'query=${qVec.length}d, doc=${dVec.length}d, cos=${_cosine(qVec, dVec).toStringAsFixed(3)}';
+      },
+    ),
+
+    TestCase(
+      id: 'embed_gemma2_image',
+      name: 'EmbeddingGemma 2 — Image embedding (test.png)',
+      description: 'Embeds bundled test.png asset into 768d unit vector.',
+      run: (ctx) async {
+        final imgBytes = await ctx.imageBytes;
+        if (imgBytes.isEmpty) throw Exception('Failed to load test.png');
+        final vec = await EmbeddingPlugin().getEmbeddingFromImage(imgBytes);
+        if (vec.isEmpty) throw Exception('Image vector is empty');
+        double normSq = 0.0;
+        for (final v in vec) {
+          normSq += v * v;
+        }
+        final norm = sqrt(normSq);
+        if (norm < 0.85 || norm > 1.15) {
+          throw Exception('Vector is not L2 unit-normalized (norm=$norm)');
+        }
+        ctx.detail = 'dim=${vec.length}, norm=${norm.toStringAsFixed(3)}, bytes=${imgBytes.length}';
+      },
+    ),
+
+    TestCase(
+      id: 'embed_gemma2_audio',
+      name: 'EmbeddingGemma 2 — Audio PCM embedding (test.wav)',
+      description: 'Embeds test.wav PCM audio using AudioEmbedPart (16kHz).',
+      run: (ctx) async {
+        final wavBytes = await ctx.audioBytes;
+        if (wavBytes.isEmpty) throw Exception('Failed to load test.wav');
+        final pcmBytes = wavBytes.length > 44 ? wavBytes.sublist(44) : wavBytes;
+        final pcm = Int16List.view(pcmBytes.buffer, pcmBytes.offsetInBytes, pcmBytes.lengthInBytes ~/ 2);
+        final part = EmbedPart.audio(pcm);
+        final vec = await EmbeddingPlugin().getEmbeddingFromParts([part]);
+        if (vec.isEmpty) throw Exception('Audio vector is empty');
+        ctx.detail = 'dim=${vec.length}, pcmSamples=${pcm.length}';
+      },
+    ),
+
+    TestCase(
+      id: 'embed_gemma2_multimodal_interleaved',
+      name: 'EmbeddingGemma 2 — Multimodal interleaved parts',
+      description: 'Embeds interleaved Text + Image + Audio parts into a single fused vector.',
+      run: (ctx) async {
+        final imgBytes = await ctx.imageBytes;
+        final wavBytes = await ctx.audioBytes;
+        final pcmBytes = wavBytes.length > 44 ? wavBytes.sublist(44) : wavBytes;
+        final pcm = Int16List.view(pcmBytes.buffer, pcmBytes.offsetInBytes, pcmBytes.lengthInBytes ~/ 2);
+
+        final parts = [
+          const EmbedPart.text('00:02 test moment timestamp'),
+          EmbedPart.image(imgBytes),
+          EmbedPart.audio(pcm),
+        ];
+
+        final vec = await EmbeddingPlugin().getEmbeddingFromParts(parts);
+        if (vec.isEmpty) throw Exception('Multimodal parts vector is empty');
+        ctx.detail = 'dim=${vec.length}, 3 parts combined';
+      },
+    ),
+
+    TestCase(
+      id: 'embed_gemma2_matryoshka',
+      name: 'EmbeddingGemma 2 — Matryoshka truncation',
+      description: 'Truncates 768d vector to 512d, 256d, 128d with automatic L2 re-normalization.',
+      run: (ctx) async {
+        final vec768 = await EmbeddingPlugin().getEmbedding('Matryoshka representation learning test');
+        if (vec768.length != 768) throw Exception('Expected 768d vector, got ${vec768.length}d');
+
+        for (final targetDim in [512, 256, 128]) {
+          final truncated = truncateMatryoshka(vec768, targetDim);
+          if (truncated.length != targetDim) {
+            throw Exception('Truncation failed: expected $targetDim, got ${truncated.length}');
+          }
+          double sumSq = 0.0;
+          for (final v in truncated) {
+            sumSq += v * v;
+          }
+          final norm = sqrt(sumSq);
+          if (norm < 0.98 || norm > 1.02) {
+            throw Exception('Truncated vector is not unit-normalized (norm=$norm)');
+          }
+        }
+        ctx.detail = '768d -> 512d, 256d, 128d (all L2 unit-norm)';
+      },
+    ),
+
+    TestCase(
+      id: 'embed_gemma2_semantic_retrieval',
+      name: 'EmbeddingGemma 2 — Semantic retrieval store',
+      description: 'Tests SemanticRetrievalService SQLite index, k-NN search and record deletion.',
+      run: (ctx) async {
+        final retrieval = SemanticRetrievalService(databaseName: 'test_integration_retrieval.db');
+        await retrieval.initialize();
+        try {
+          final imgBytes = await ctx.imageBytes;
+          await retrieval.addRecord('test_img_1', imgBytes, metadata: {'type': 'photo', 'label': 'flower'});
+
+          final textVec = await EmbeddingPlugin().getEmbedding(
+            'Golden retriever puppy playing in the grass',
+            taskType: EmbeddingTaskType.retrievalDocument,
+          );
+          await retrieval.insertVectorRecord('test_doc_1', textVec, metadata: {'type': 'doc', 'label': 'dog'});
+
+          final results = await retrieval.retrieveEntities('puppy in grass', limit: 2);
+          if (results.isEmpty) throw Exception('Retrieval search returned 0 results');
+
+          final top = results.first;
+          await retrieval.deleteRecord('test_img_1');
+          await retrieval.deleteRecord('test_doc_1');
+          await retrieval.deleteAllRecords();
+          ctx.detail = 'Indexed 2 records, search matched "${top.id}" (sim=${(top.similarityScore ?? 0).toStringAsFixed(3)})';
+        } finally {
+          retrieval.dispose();
+        }
+      },
+    ),
+
+    TestCase(
+      id: 'embed_gemma2_video_window_indexing',
+      name: 'EmbeddingGemma 2 — Video moment indexing & search',
+      description: 'Indexes video time windows with frame & audio parts using VideoMomentService.',
+      run: (ctx) async {
+        final retrieval = SemanticRetrievalService(databaseName: 'test_video_moments.db');
+        await retrieval.initialize();
+        final momentService = VideoMomentService(retrievalService: retrieval);
+        try {
+          final imgBytes = await ctx.imageBytes;
+          final wavBytes = await ctx.audioBytes;
+          final pcmBytes = wavBytes.length > 44 ? wavBytes.sublist(44) : wavBytes;
+          final pcm = Int16List.view(pcmBytes.buffer, pcmBytes.offsetInBytes, pcmBytes.lengthInBytes ~/ 2);
+
+          const project = VideoMomentProject(
+            id: 'test_vid_proj',
+            videoPath: 'dummy_video.mp4',
+            displayName: 'Test Video Project',
+            durationMs: 4000,
+            windowDurationSec: 2,
+            framesPerWindow: 2,
+            includeAudio: true,
+          );
+          momentService.addProject(project);
+
+          await momentService.indexProject(
+            project: project,
+            extractFrames: (timestamps) async => [imgBytes, imgBytes],
+            extractAudioPcm: (startMs, endMs) async => pcm.length > 1000 ? pcm.sublist(0, 1000) : pcm,
+          );
+
+          await momentService.searchMoments('test moment');
+          final results = momentService.searchResults;
+          if (results.isEmpty) throw Exception('No moment search results returned');
+
+          final top = results.first;
+          await momentService.deleteProject('test_vid_proj');
+          ctx.detail = 'Indexed windows, matched moment ${top.formattedTimeRange} (sim=${(top.similarityScore * 100).round()}%)';
+        } finally {
+          momentService.dispose();
+          retrieval.dispose();
+        }
+      },
+    ),
+
     TestCase(
       id: 'embed_unload',
       name: 'Embedding — Unload engine',
@@ -1214,6 +1565,7 @@ class TestSuite {
             'EmbeddingPlugin still reports isInitialized after dispose()',
           );
         }
+        ctx.detail = 'Unloaded successfully';
       },
     ),
 
@@ -1223,6 +1575,11 @@ class TestSuite {
       name: 'Cache — Purge all cached files',
       description: 'ModelInstaller.purgeCache() completes without error.',
       run: (ctx) async {
+        if (ctx.skipCachePurgeOnRunAll) {
+          throw _SkipException(
+            'Skipped during Run All to preserve downloaded models on device. Tap Run individually to test purge.',
+          );
+        }
         if (FlutterLocalGemma().isInitialized) await PluginModelLoader.unloadLlm();
         if (EmbeddingPlugin().isInitialized)
           await PluginModelLoader.unloadEmbedding();
@@ -1233,6 +1590,7 @@ class TestSuite {
         ctx.llmPath = null;
         ctx.embedPath = null;
         ctx.tokenizerPath = null;
+        ctx.detail = 'Freed $freed';
       },
     ),
   ];

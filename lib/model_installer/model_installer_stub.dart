@@ -19,3 +19,5 @@ Future<int> purgeModelCacheImpl() async => 0;
 
 // Web-only – not available on this platform.
 Future<List<Map<String, dynamic>>> listOpfsCacheImpl() async => [];
+Future<bool> isTransformersModelCachedImpl(String pattern) async => false;
+Future<bool> deleteTransformersModelImpl(String pattern) async => false;

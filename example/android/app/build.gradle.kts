@@ -15,10 +15,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_17.toString()
-    }
-
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.example.flutter_local_gemma_example"
@@ -37,8 +33,24 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            pickFirsts.add("**/libsqlite_vector_store_jni.so")
+            pickFirsts.add("**/liblitertlm_jni.so")
+            pickFirsts.add("**/libc++_shared.so")
+        }
+    }
 }
 
 flutter {
     source = "../.."
+}
+
+// Configures JVM target for Kotlin 2.0+ using the compilerOptions DSL
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
 }

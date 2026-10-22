@@ -6,6 +6,7 @@ import '../model_installer/model_installer.dart';
 export '../model_installer/model_installer.dart';
 
 import '../types/content_parts.dart';
+import 'gemma_state.dart';
 import 'gemma_web.dart' if (dart.library.io) 'gemma_stub.dart';
 
 // ─── Configuration types ──────────────────────────────────────────────────────
@@ -47,8 +48,22 @@ class InferenceConfig {
   /// KV-cache capacity. Larger values use more RAM.
   final int maxTokens;
 
-  /// null = let the native side decide (usually CPU).
-  final PreferredBackend? backend;
+  /// Preferred compute backend for text generation *and* vision encoding.
+  ///
+  /// Defaults to [PreferredBackend.gpu] on Android: GPU is meaningfully
+  /// faster for both LLM decoding and image-token encoding on the vast
+  /// majority of devices, and [FlutterLocalGemma.init] automatically falls
+  /// back to CPU if GPU delegate initialisation fails (missing/broken
+  /// OpenCL, emulator, etc.) — so this is safe to leave at its default.
+  ///
+  /// Pass [PreferredBackend.cpu] explicitly to force CPU (e.g. for
+  /// reproducible benchmarking, or on devices you know lack usable GPU
+  /// delegates).
+  ///
+  /// **Audio note:** [supportAudio] is always served by the CPU backend
+  /// regardless of this setting — LiteRT-LM does not currently ship a GPU
+  /// audio encoder.
+  final PreferredBackend backend;
 
   final int? maxNumImages;
   final bool supportAudio;
@@ -67,14 +82,18 @@ class InferenceConfig {
   /// detection on Web when the OPFS URL strips the file name).
   final String? modelName;
 
+  /// Optional download/initialisation progress callback.
+  final void Function(double progress)? onProgress;
+
   InferenceConfig({
     required this.modelPath,
     this.maxTokens   = 4096,
-    this.backend,
+    this.backend     = PreferredBackend.gpu,
     this.maxNumImages,
     this.supportAudio = false,
     this.enableMtp    = true,
     this.modelName,
+    this.onProgress,
   });
 }
 
@@ -190,7 +209,7 @@ class TokenStats {
 
   @override
   String toString() =>
-      'TokenStats($estimatedUsed / $maxContext used, ${remaining} remaining)';
+      'TokenStats($estimatedUsed / $maxContext used, $remaining remaining)';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,7 +242,6 @@ class FlutterLocalGemma {
   int  _maxTokens     = 0;
   String? _currentModelPath;
   String? _currentModelName;
-  bool _currentModelIsGemma4 = false;
 
   Future<dynamic> Function(Map<String, dynamic>)? _nativeToolHandler;
 
@@ -308,47 +326,126 @@ class FlutterLocalGemma {
   String? get currentModelName => _currentModelName;
 
   /// Whether the currently loaded model is identified as Gemma 4.
-  bool get currentModelIsGemma4 => _currentModelIsGemma4;
+  bool get currentModelIsGemma4 {
+    final str = (_currentModelName ?? _currentModelPath ?? '').toLowerCase();
+    return str.contains('gemma-4') ||
+           str.contains('gemma_4') ||
+           str.contains('gemma4');
+  }
+
+  /// Whether the currently loaded model is identified as an ONNX model.
+  bool get currentModelIsOnnx =>
+      (_currentModelName ?? _currentModelPath ?? '').toLowerCase().contains('onnx');
+
+  /// Whether the currently loaded model supports image/vision inputs.
+  bool get currentModelSupportsVision {
+    if (kIsWeb) {
+      // On Web, only ONNX models or Gemma 3n models support vision inputs.
+      // Standard LiteRT / MediaPipe web models (e.g. Gemma 4 .task / .litertlm)
+      // do not have Web vision calculator models and cannot process images.
+      if (currentModelIsOnnx) return true;
+      final name = (_currentModelName ?? _currentModelPath ?? '').toLowerCase();
+      if (name.contains('gemma-3n') || name.contains('gemma_3n') || name.contains('gemma3n')) {
+        return true;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /// Whether the currently loaded model supports audio inputs.
+  bool get currentModelSupportsAudio {
+    if (kIsWeb) {
+      // On Web, only ONNX models or Gemma 3n models support audio inputs.
+      // Standard LiteRT / MediaPipe web models (e.g. Gemma 4 .task / .litertlm)
+      // do not have Web audio processing support.
+      if (currentModelIsOnnx) return true;
+      final name = (_currentModelName ?? _currentModelPath ?? '').toLowerCase();
+      if (name.contains('gemma-3n') || name.contains('gemma_3n') || name.contains('gemma3n')) {
+        return true;
+      }
+      return false;
+    }
+    final name = (_currentModelName ?? _currentModelPath ?? '').toLowerCase();
+    if (name.contains('e4b') && !name.contains('3n')) {
+      return false;
+    }
+    return true;
+  }
 
   /// Initialises the inference engine.
   ///
   /// Calling [init] when the engine is already initialised is a no-op; call
-  /// [dispose] first if you need to swap to a different model.
+  /// [dispose] first if you need to swap to a different model — or use
+  /// `PluginModelLoader.switchLlm(...)` (in `helpers/model_loader.dart`),
+  /// which does that for you safely.
+  ///
+  /// Tracks [GemmaState.loadState] throughout: [ModelLoadState.loading]
+  /// while this call is in flight, [ModelLoadState.loaded] on success, and
+  /// [ModelLoadState.error] (with [GemmaState.lastError] set) if it throws.
+  /// Note: [ModelLoadState.downloading] is set by the *helpers* that
+  /// download a model first (`PluginModelLoader`/`GemmaLoader`) — `init()`
+  /// itself only ever resolves an already-local file, it doesn't download.
   Future<void> init(InferenceConfig config) async {
-    if (_isInitialized) return;
-    _maxTokens = config.maxTokens;
-    _currentModelPath = config.modelPath;
-    _currentModelName = config.modelName ?? _extractNameFromPath(config.modelPath);
-    
-    final pathToCheck = (_currentModelName ?? _currentModelPath!).toLowerCase();
-    _currentModelIsGemma4 = pathToCheck.contains('gemma-4') || pathToCheck.contains('gemma_4');
-
-    if (kIsWeb) {
-      await FlutterLocalGemmaWeb().init(config);
-    } else {
-      // Subscribe to the Android EventChannel once here so there is never a
-      // window where the sink is null between two consecutive generations.
-      _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
-        (event) {
-          if (event is Map) {
-            _eventController.add(event);
-          }
-        },
-        onError: _eventController.addError,
-      );
-
-      await _channel.invokeMethod('createModel', {
-        'modelPath':       config.modelPath,
-        'maxTokens':       config.maxTokens,
-        'preferredBackend': config.backend?.index ?? 0,
-        'maxNumImages':    config.maxNumImages,
-        'supportAudio':    config.supportAudio,
-        'enableMtp':       config.enableMtp,
-      });
-      _channel.setMethodCallHandler(_handleNativeMethodCall);
+    if (_isInitialized) {
+      if (_currentModelPath == null && config.modelPath.isNotEmpty) {
+        _currentModelPath = config.modelPath;
+      }
+      _currentModelName ??= config.modelName ?? _extractNameFromPath(config.modelPath);
+      return;
     }
-    
-    _isInitialized = true;
+    if (GemmaState.instance.isLoadBusy) {
+      throw StateError(
+        'A model load/download/unload is already in progress '
+        '(GemmaState.instance.loadState == '
+        '${GemmaState.instance.loadState.value}). Await it (or check '
+        'GemmaState.instance.loadState) before calling init() again.',
+      );
+    }
+
+    GemmaState.instance.setLastError(null);
+    GemmaState.instance.setLoadState(ModelLoadState.loading);
+
+    try {
+      _maxTokens = config.maxTokens;
+      _currentModelPath = config.modelPath;
+      _currentModelName = config.modelName ?? _extractNameFromPath(config.modelPath);
+
+      if (kIsWeb) {
+        await FlutterLocalGemmaWeb().init(config);
+      } else {
+        // Subscribe to the Android EventChannel once here so there is never a
+        // window where the sink is null between two consecutive generations.
+        _eventSubscription ??= _eventChannel.receiveBroadcastStream().listen(
+          (event) {
+            if (event is Map) {
+              _eventController.add(event);
+            }
+          },
+          onError: _eventController.addError,
+        );
+
+        await _channel.invokeMethod('createModel', {
+          'modelPath':       config.modelPath,
+          'maxTokens':       config.maxTokens,
+          'preferredBackend': config.backend.index,
+          'maxNumImages':    config.maxNumImages,
+          'supportAudio':    config.supportAudio,
+          'enableMtp':       config.enableMtp,
+        });
+        _channel.setMethodCallHandler(_handleNativeMethodCall);
+      }
+
+      _isInitialized = true;
+      GemmaState.instance.setLoadState(ModelLoadState.loaded);
+    } catch (e) {
+      _isInitialized = false;
+      _currentModelPath = null;
+      _currentModelName = null;
+      GemmaState.instance.setLastError(e);
+      GemmaState.instance.setLoadState(ModelLoadState.error);
+      rethrow;
+    }
   }
 
   String? _extractNameFromPath(String path) {
@@ -429,19 +526,34 @@ class FlutterLocalGemma {
   /// On web, calls `unloadLLM` which releases GPU/WASM memory.
   ///
   /// After dispose, [init] must be called again before any further use.
+  /// Tracks [GemmaState.loadState] ([ModelLoadState.unloading] while in
+  /// flight, [ModelLoadState.notLoaded] on success).
   Future<void> dispose() async {
     if (!_isInitialized) return;
 
-    if (kIsWeb) {
-      FlutterLocalGemmaWeb().unload();
-    } else {
-      await _channel.invokeMethod('closeModel');
-      await _eventSubscription?.cancel();
-      _eventSubscription = null;
-    }
+    GemmaState.instance.setLoadState(ModelLoadState.unloading);
+    try {
+      if (kIsWeb) {
+        await FlutterLocalGemmaWeb().unload();
+      } else {
+        await _channel.invokeMethod('closeModel');
+        await _eventSubscription?.cancel();
+        _eventSubscription = null;
+      }
 
-    _isInitialized = false;
-    _currentModelPath = null;
+      _isInitialized = false;
+      _currentModelPath = null;
+      _currentModelName = null;
+      GemmaState.instance.setLoadState(ModelLoadState.notLoaded);
+      // A stray session could theoretically be mid-generation if the caller
+      // disposes without stopping it first — reset so the UI doesn't get
+      // stuck showing a busy state for a model that no longer exists.
+      GemmaState.instance.setInferenceState(GemmaInferenceState.idle);
+    } catch (e) {
+      GemmaState.instance.setLastError(e);
+      GemmaState.instance.setLoadState(ModelLoadState.error);
+      rethrow;
+    }
   }
 
   // ── Internal accessor used by ChatSession ──────────────────────────────────
@@ -540,11 +652,33 @@ class ChatSession {
 
   /// Streams tokens as they are generated. Closes the returned stream when
   /// generation finishes (or is cancelled).
+  ///
+  /// Tracks [GemmaState.inferenceState]: [GemmaInferenceState.processingInput]
+  /// while [input] is being pushed to the native side,
+  /// [GemmaInferenceState.answering] once tokens start arriving, and back to
+  /// [GemmaInferenceState.idle] when the stream closes (or
+  /// [GemmaInferenceState.error] if it fails). This raw stream has no
+  /// concept of "thinking" vs "answering" — use
+  /// [GemmaChat.sendMessageResponseStream] or [AgentChat.run] for that
+  /// distinction (and for [GemmaInferenceState.toolCalling]).
   Stream<String> generateResponseStream(List<ContentPart> input) {
     final controller = StreamController<String>();
+    bool reachedTerminalState = false;
+
+    void toIdleOrError(Object? error) {
+      if (reachedTerminalState) return;
+      reachedTerminalState = true;
+      if (error != null) {
+        GemmaState.instance.setLastError(error);
+        GemmaState.instance.setInferenceState(GemmaInferenceState.error);
+      } else {
+        GemmaState.instance.setInferenceState(GemmaInferenceState.idle);
+      }
+    }
 
     Future<void> run() async {
       try {
+        GemmaState.instance.setInferenceState(GemmaInferenceState.processingInput);
         await addToContext(input);
         if (kIsWeb) {
           await _streamWeb(controller);
@@ -552,6 +686,7 @@ class ChatSession {
           await _streamMobile(controller);
         }
       } catch (e, st) {
+        toIdleOrError(e);
         if (!controller.isClosed) {
           controller.addError(e, st);
           controller.close();
@@ -560,30 +695,71 @@ class ChatSession {
     }
 
     run();
-    return controller.stream;
+
+    return controller.stream.transform(
+      StreamTransformer<String, String>.fromHandlers(
+        handleData: (data, sink) {
+          if (GemmaState.instance.inferenceState.value !=
+              GemmaInferenceState.answering) {
+            GemmaState.instance.setInferenceState(GemmaInferenceState.answering);
+          }
+          sink.add(data);
+        },
+        handleError: (e, st, sink) {
+          toIdleOrError(e);
+          sink.addError(e, st);
+        },
+        handleDone: (sink) {
+          toIdleOrError(null);
+          sink.close();
+        },
+      ),
+    );
   }
 
   /// Generates a full response and returns it as a single [String].
   ///
   /// On mobile, uses the synchronous native path (`generateResponseSync`).
   /// On web, collects the full streaming response.
+  ///
+  /// Tracks [GemmaState.inferenceState] the same way [generateResponseStream]
+  /// does: [GemmaInferenceState.processingInput] →
+  /// [GemmaInferenceState.answering] → [GemmaInferenceState.idle] (or
+  /// [GemmaInferenceState.error]). On mobile this is one blocking native
+  /// call, so there's no token-by-token granularity — the whole call is
+  /// reported as `answering`.
   Future<String> generateResponseFuture(List<ContentPart> input) async {
     if (kIsWeb) {
+      // Routes through generateResponseStream, which already tracks state.
       final buffer = StringBuffer();
       await for (final chunk in generateResponseStream(input)) {
         buffer.write(chunk);
       }
       return buffer.toString();
     } else {
-      await addToContext(input);
-      final String? result =
-          await _channel?.invokeMethod<String>('generateResponseSync');
-      return result ?? '';
+      GemmaState.instance.setInferenceState(GemmaInferenceState.processingInput);
+      try {
+        await addToContext(input);
+        GemmaState.instance.setInferenceState(GemmaInferenceState.answering);
+        final String? result =
+            await _channel?.invokeMethod<String>('generateResponseSync');
+        GemmaState.instance.setInferenceState(GemmaInferenceState.idle);
+        return result ?? '';
+      } catch (e) {
+        GemmaState.instance.setLastError(e);
+        GemmaState.instance.setInferenceState(GemmaInferenceState.error);
+        rethrow;
+      }
     }
   }
 
   /// Signals the native side to abort the current generation mid-stream.
+  ///
+  /// Sets [GemmaState.inferenceState] to [GemmaInferenceState.cancelling];
+  /// it returns to [GemmaInferenceState.idle] once the stream actually
+  /// closes.
   Future<void> stopGeneration() async {
+    GemmaState.instance.setInferenceState(GemmaInferenceState.cancelling);
     if (kIsWeb) {
       await FlutterLocalGemmaWeb().cancelProcessing();
     } else {
@@ -617,23 +793,34 @@ class ChatSession {
     for (final part in parts) {
       if (part is TextPart) {
         await _channel.invokeMethod('addQueryChunk', {'prompt': part.text});
+      } else if (part is ImageFilePart) {
+        // Zero-copy: native reads the file directly, no byte-array transfer.
+        await _channel.invokeMethod('addImageFile', {'path': part.path});
       } else if (part is ImagePart) {
         await _channel.invokeMethod('addImage', {'imageBytes': part.bytes});
+      } else if (part is AudioFilePart) {
+        await _channel.invokeMethod('addAudioFile', {'path': part.path});
       } else if (part is AudioPart) {
         await _channel.invokeMethod('addAudio', {'audioBytes': part.bytes});
       }
     }
   }
 
+  /// Fixed duration estimate (ms) used for [AudioFilePart]s that don't
+  /// specify [AudioFilePart.durationMs]. Deliberately conservative — pass
+  /// the real duration when you know it for an accurate token count.
+  static const int _defaultAudioFileDurationMs = 5000;
+
   Future<int> _estimatePartTokens(List<ContentPart> parts) async {
     final textBuf    = StringBuffer();
     int imgCount     = 0;
     int audDurationMs = 0;
     for (final p in parts) {
-      if (p is TextPart)  textBuf.write(p.text);
-      if (p is ImagePart) imgCount++;
+      if (p is TextPart) textBuf.write(p.text);
+      if (p is ImagePart || p is ImageFilePart) imgCount++;
       // Standard 16 kHz 16-bit mono PCM: 32 bytes per millisecond.
       if (p is AudioPart) audDurationMs += p.bytes.length ~/ 32;
+      if (p is AudioFilePart) audDurationMs += p.durationMs ?? _defaultAudioFileDurationMs;
     }
     return countTokens(
       textBuf.toString(),
@@ -643,6 +830,15 @@ class ChatSession {
   }
 
   Future<void> _streamWeb(StreamController<String> controller) async {
+    // Safety net: if the caller cancels the returned stream before generation
+    // finishes (widget disposed, navigated away, etc.), don't leave
+    // GemmaState.inferenceState stuck on `answering`/`processingInput`.
+    controller.onCancel = () {
+      if (GemmaState.instance.inferenceState.value != GemmaInferenceState.error) {
+        GemmaState.instance.setInferenceState(GemmaInferenceState.idle);
+      }
+    };
+
     FlutterLocalGemmaWeb()
         .generateResponse(autoStopConfig: webConfig?.autoStopConfig ?? const AutoStopConfig())
         .listen(
@@ -714,6 +910,11 @@ class ChatSession {
           _channel?.invokeMethod('stopGeneration');
         }
         sub?.cancel();
+        // Safety net: don't leave GemmaState.inferenceState stuck on
+        // `answering`/`processingInput` if the caller cancels early.
+        if (GemmaState.instance.inferenceState.value != GemmaInferenceState.error) {
+          GemmaState.instance.setInferenceState(GemmaInferenceState.idle);
+        }
       };
     } catch (e) {
       controller.addError(e);

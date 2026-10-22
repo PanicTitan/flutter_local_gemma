@@ -8,10 +8,12 @@ import 'package:flutter_local_gemma/flutter_local_gemma.dart';
 
 import '../app_state.dart';
 import '../demo_skills.dart';
+import '../services/foreground_task_controller.dart';
 import '../utils/model_loader.dart';
 import '../widgets/model_status_chip.dart';
 import '../widgets/token_counter_bar.dart';
 import '../widgets/message_bubble.dart';
+import 'models_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -49,6 +51,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool   _enableMultimodality = true;
   String _customSchema = '';
   double _loadProgress = 0;
+  bool   _keepForegroundWhileBusy = ForegroundTaskController.instance.enabled;
 
   // ── Token tracking ─────────────────────────────────────────────────────────
   int _inputPendingTokens = 0;
@@ -226,6 +229,18 @@ class _ChatScreenState extends State<ChatScreen> {
     // Flatten pending PDFs into text + image arrays
     final allImages = List<Uint8List>.from(_pendingImages);
     final allAudios = List<Uint8List>.from(_pendingAudios);
+
+    final supportsVision = FlutterLocalGemma().currentModelSupportsVision;
+    final supportsAudio = FlutterLocalGemma().currentModelSupportsAudio;
+
+    if (allImages.isNotEmpty && !supportsVision) {
+      _snack('The currently loaded model does not support image input.');
+      return;
+    }
+    if (allAudios.isNotEmpty && !supportsAudio) {
+      _snack('The currently loaded model does not support audio input.');
+      return;
+    }
 
     String payloadText = text;
     for (final pdf in _pendingPdfs) {
@@ -471,6 +486,41 @@ class _ChatScreenState extends State<ChatScreen> {
       endDrawer: _buildSettingsDrawer(),
       body: Column(
         children: [
+          // ── GemmaState test/debug bar ────────────────────────────────────
+          // Purely for verifying the reactive state API (see gemma_state.dart
+          // / README "State Management — GemmaState"). Bound directly to
+          // GemmaState.instance — NOT to this screen's own ModelManager/
+          // ModelStatus (the chip in the AppBar above), so it's an
+          // independent way to confirm the package's own state tracking is
+          // actually correct.
+          AnimatedBuilder(
+            animation: GemmaState.instance.listenable,
+            builder: (context, _) {
+              final loadState = GemmaState.instance.loadState.value;
+              final inferState = GemmaState.instance.inferenceState.value;
+              return Container(
+                width: double.infinity,
+                color: cs.surfaceContainerHighest,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    const Text('GemmaState:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                    _StatePill(label: 'load: ${loadState.name}', color: _loadStateColor(loadState, cs)),
+                    _StatePill(label: 'inference: ${inferState.name}', color: _inferenceStateColor(inferState, cs)),
+                    if (GemmaState.instance.lastError.value != null)
+                      _StatePill(
+                        label: 'error: ${GemmaState.instance.lastError.value}',
+                        color: cs.error,
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+
           // Download progress bar
           if (_loadProgress > 0)
             LinearProgressIndicator(value: _loadProgress / 100, minHeight: 3),
@@ -574,6 +624,17 @@ class _ChatScreenState extends State<ChatScreen> {
               icon: const Icon(Icons.folder_open_outlined),
               label: const Text('Load Local File'),
             ),
+            const SizedBox(height: 10),
+            FilledButton.tonalIcon(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const ModelsScreen()),
+                );
+              },
+              icon: const Icon(Icons.tune),
+              label: const Text('Models Manager (ONNX / WebGPU)'),
+            ),
           ],
         ),
       ),
@@ -656,11 +717,39 @@ class _ChatScreenState extends State<ChatScreen> {
                     if (v == 'audio') _pickAudio();
                     if (v == 'pdf')   _pickPdf();
                   },
-                  itemBuilder: (_) => const [
-                    PopupMenuItem(value: 'image', child: ListTile(leading: Icon(Icons.image_outlined),       title: Text('Image'),    dense: true)),
-                    PopupMenuItem(value: 'audio', child: ListTile(leading: Icon(Icons.audiotrack_outlined),  title: Text('Audio'),    dense: true)),
-                    PopupMenuItem(value: 'pdf',   child: ListTile(leading: Icon(Icons.picture_as_pdf),       title: Text('PDF'),      dense: true)),
-                  ],
+                  itemBuilder: (_) {
+                    final supportsVision = FlutterLocalGemma().currentModelSupportsVision;
+                    final supportsAudio = FlutterLocalGemma().currentModelSupportsAudio;
+                    return [
+                      PopupMenuItem(
+                        value: 'image',
+                        enabled: supportsVision,
+                        child: ListTile(
+                          leading: Icon(Icons.image_outlined, color: supportsVision ? null : Colors.grey),
+                          title: Text(supportsVision ? 'Image' : 'Image (unsupported)'),
+                          dense: true,
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'audio',
+                        enabled: supportsAudio,
+                        child: ListTile(
+                          leading: Icon(Icons.audiotrack_outlined, color: supportsAudio ? null : Colors.grey),
+                          title: Text(supportsAudio ? 'Audio' : 'Audio (unsupported)'),
+                          dense: true,
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'pdf',
+                        enabled: supportsVision,
+                        child: ListTile(
+                          leading: Icon(Icons.picture_as_pdf, color: supportsVision ? null : Colors.grey),
+                          title: Text(supportsVision ? 'PDF' : 'PDF (requires vision)'),
+                          dense: true,
+                        ),
+                      ),
+                    ];
+                  },
                 ),
 
                 // Text input
@@ -723,6 +812,21 @@ class _ChatScreenState extends State<ChatScreen> {
                 label: const Text('Local File'),
               )),
             ]),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.tonalIcon(
+                onPressed: () {
+                  Navigator.pop(context);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const ModelsScreen()),
+                  );
+                },
+                icon: const Icon(Icons.tune, size: 18),
+                label: const Text('Models Manager (ONNX, LiteRT)'),
+              ),
+            ),
             if (mgr.llmStatus != ModelStatus.unloaded)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
@@ -738,6 +842,16 @@ class _ChatScreenState extends State<ChatScreen> {
             // ── Chat Modes ─────────────────────────────────────────────────
             const _SectionHeader('Chat'),
             SwitchListTile(dense: true, title: const Text('Stream responses'), value: _useStream, onChanged: (v) => setState(() => _useStream = v)),
+            SwitchListTile(
+              dense: true,
+              title: const Text('Keep app active while generating'),
+              subtitle: const Text('Android: runs a foreground service while the model is busy, so long generations aren\'t killed in the background'),
+              value: _keepForegroundWhileBusy,
+              onChanged: (v) {
+                setState(() => _keepForegroundWhileBusy = v);
+                ForegroundTaskController.instance.enabled = v;
+              },
+            ),
             SwitchListTile(
               dense: true,
               title: const Text('JSON Schema mode'),
@@ -855,6 +969,38 @@ class _ChatScreenState extends State<ChatScreen> {
 }
 
 // ─── Local helpers ─────────────────────────────────────────────────────────────
+
+/// Small colored chip used by the GemmaState test/debug bar in the AppBar.
+class _StatePill extends StatelessWidget {
+  final String label;
+  final Color color;
+  const _StatePill({required this.label, required this.color});
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        decoration: BoxDecoration(color: color.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(12), border: Border.all(color: color, width: 1)),
+        child: Text(label, style: TextStyle(fontSize: 11, color: color, fontWeight: FontWeight.w600)),
+      );
+}
+
+Color _loadStateColor(ModelLoadState state, ColorScheme cs) => switch (state) {
+      ModelLoadState.notLoaded => cs.outline,
+      ModelLoadState.downloading => Colors.blue,
+      ModelLoadState.loading => Colors.orange,
+      ModelLoadState.loaded => Colors.green,
+      ModelLoadState.unloading => Colors.orange,
+      ModelLoadState.error => cs.error,
+    };
+
+Color _inferenceStateColor(GemmaInferenceState state, ColorScheme cs) => switch (state) {
+      GemmaInferenceState.idle => cs.outline,
+      GemmaInferenceState.processingInput => Colors.blue,
+      GemmaInferenceState.thinking => Colors.purple,
+      GemmaInferenceState.answering => Colors.green,
+      GemmaInferenceState.toolCalling => Colors.orange,
+      GemmaInferenceState.cancelling => Colors.orange,
+      GemmaInferenceState.error => cs.error,
+    };
 
 class _SectionHeader extends StatelessWidget {
   final String title;

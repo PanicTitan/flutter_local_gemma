@@ -9,8 +9,13 @@ export 'gemma/gemma_model.dart';
 export 'gemma/gemma_response.dart';
 export 'gemma/gemma_skill.dart';
 
+/// Reactive model-load / inference-activity state (ModelLoadState,
+/// GemmaInferenceState, GemmaState.instance).
+export 'gemma/gemma_state.dart';
+
 /// High-level model download + lifecycle helper.
 export 'gemma/gemma_loader.dart';
+export 'helpers/model_loader.dart';
 
 // ── Chat wrappers ─────────────────────────────────────────────────────────────
 
@@ -44,8 +49,14 @@ export 'chat/gemma_text_parser.dart';
 export 'json_schema/schema.dart';
 export 'json_schema/json_repair.dart';
 
-// ── Embedding engine ──────────────────────────────────────────────────────────
+// ── Embedding engine & Semantic Retrieval ────────────────────────────────────
 export 'embedding/embedding_plugin.dart';
+export 'embedding/embed_part.dart';
+export 'embedding/embedding_model_catalog.dart';
+export 'embedding/semantic_retrieval_service.dart';
+export 'embedding/gallery_search_service.dart';
+export 'embedding/video_moment_service.dart';
+export 'model_picker/model_picker.dart';
 
 // ── PDF extraction ────────────────────────────────────────────────────────────
 export 'pdf/pdf_processor.dart';

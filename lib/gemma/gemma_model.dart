@@ -52,6 +52,45 @@ enum GemmaModel {
     supportsMtp: true,
     isGated: false,
     sizeDescription: '3.7 GB  •  Open',
+  ),
+  gemma4E2BOnnx(
+    androidRepo: 'litert-community/gemma-4-E2B-it-litert-lm',
+    androidFile: 'gemma-4-E2B-it.litertlm',
+    webRepo: 'onnx-community/gemma-4-E2B-it-ONNX',
+    webFile: 'gemma-4-E2B-it.onnx',
+    supportsVision: true,
+    supportsAudio: true,
+    supportsTools: true,
+    supportsThinking: true,
+    supportsMtp: true,
+    isGated: false,
+    sizeDescription: 'q4f16  •  Open  •  ONNX WebGPU',
+  ),
+  gemma4E4BOnnx(
+    androidRepo: 'litert-community/gemma-4-E4B-it-litert-lm',
+    androidFile: 'gemma-4-E4B-it.litertlm',
+    webRepo: 'onnx-community/gemma-4-E4B-it-ONNX',
+    webFile: 'gemma-4-E4B-it.onnx',
+    supportsVision: true,
+    supportsAudio: true,
+    supportsTools: true,
+    supportsThinking: true,
+    supportsMtp: true,
+    isGated: false,
+    sizeDescription: 'q4f16  •  Open  •  ONNX WebGPU',
+  ),
+  embeddingGemma2(
+    androidRepo: 'litert-community/embeddinggemma-2-740m-litert-lm',
+    androidFile: 'embeddinggemma-2-740m.litertlm',
+    webRepo: 'onnx-community/embeddinggemma-2-ONNX',
+    webFile: 'onnx/model_q4.onnx',
+    supportsVision: true,
+    supportsAudio: true,
+    supportsTools: false,
+    supportsThinking: false,
+    supportsMtp: false,
+    isGated: false,
+    sizeDescription: '405 MB  •  Open  •  Multimodal Embedder',
   );
 
   const GemmaModel({
@@ -77,12 +116,17 @@ enum GemmaModel {
       'https://huggingface.co/$androidRepo/resolve/main/$androidFile';
   String get webUrl =>
       'https://huggingface.co/$webRepo/resolve/main/$webFile';
+  bool get isOnnx => webFile.endsWith('.onnx') || webRepo.contains('onnx');
   bool get isGemma4 => supportsMtp;
-  bool get isGemma3n => !isGemma4;
+  bool get isGemma3n => !isGemma4 && this != GemmaModel.embeddingGemma2;
+  bool get isEmbedding => this == GemmaModel.embeddingGemma2;
   String get displayName => switch (this) {
         GemmaModel.gemma3nE2B => 'Gemma 3n E2B',
         GemmaModel.gemma3nE4B => 'Gemma 3n E4B',
         GemmaModel.gemma4E2B => 'Gemma 4 E2B',
         GemmaModel.gemma4E4B => 'Gemma 4 E4B',
+        GemmaModel.gemma4E2BOnnx => 'Gemma 4 E2B (ONNX)',
+        GemmaModel.gemma4E4BOnnx => 'Gemma 4 E4B (ONNX)',
+        GemmaModel.embeddingGemma2 => 'EmbeddingGemma 2',
       };
 }

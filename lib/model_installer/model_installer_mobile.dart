@@ -23,6 +23,9 @@ Future<String> createBlobInstaller(Object blob) async =>
 
 // Web-only stub.
 Future<List<Map<String, dynamic>>> listOpfsCacheImpl() async => [];
+Future<bool> isTransformersModelCachedImpl(String pattern) async => false;
+Future<bool> deleteTransformersModelImpl(String pattern) async => false;
+
 
 /// Deletes all cached model files on Android.
 ///
@@ -105,10 +108,13 @@ class MobileModelDownloader extends ModelDownloaderBuilder {
     }
     if (await file.exists()) await file.delete();
 
+    final hasValidToken = token != null &&
+        token!.trim().isNotEmpty &&
+        !token!.contains('YOUR_TOKEN');
     final task = DownloadTask(
       url:           url,
       filename:      fileName,
-      headers:       token != null ? {'Authorization': 'Bearer $token'} : {},
+      headers:       hasValidToken ? {'Authorization': 'Bearer ${token!.trim()}'} : {},
       baseDirectory: baseDir,
       directory:     directoryPath ?? '',
       updates:       Updates.statusAndProgress,
@@ -117,10 +123,17 @@ class MobileModelDownloader extends ModelDownloaderBuilder {
 
     final result = await FileDownloader().download(
       task,
-      onProgress: (p) => onProgressCallback?.call(p * 100),
+      onProgress: (p) {
+        if (p >= 0) {
+          onProgressCallback?.call(p * 100);
+        }
+      },
     );
 
-    if (result.status == TaskStatus.complete) return fullPath;
+    if (result.status == TaskStatus.complete) {
+      onProgressCallback?.call(100.0);
+      return fullPath;
+    }
     throw Exception('Download failed: ${result.status}');
   }
 }

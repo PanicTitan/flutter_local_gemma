@@ -8,11 +8,12 @@ A full-featured Flutter application that demonstrates all capabilities of the `f
 
 | Screen | File | What it shows |
 |--------|------|---------------|
-| **Chat** | `lib/screens/chat_screen.dart` | Multi-turn streaming conversation with `GemmaChat`. Includes a token-usage bar and stop-generation button. |
-| **Smart Chat** | `lib/screens/smart_chat_screen.dart` | Multimodal input — attach images or audio alongside text messages. |
-| **Embedding** | `lib/screens/embedding_screen.dart` | Compute semantic embeddings and display cosine-similarity scores between sentences. |
-| **Benchmark** | `lib/screens/benchmark_screen.dart` | Measure tokens-per-second throughput using `BenchmarkRunner`. |
-| **Test Runner** | `lib/screens/test_runner_screen.dart` | Run the built-in integration test suite against the live model. |
+| **Chat** | `lib/screens/chat_screen.dart` | Multi-turn streaming conversation with `GemmaChat`. Supports text, image, audio, and PDF attachments (guarded by model capabilities), token-usage counter, and thinking mode expansion tiles. |
+| **Models** | `lib/screens/models_screen.dart` | Interactive model manager to download, load, unload, and purge all Gemma variants (Gemma 3n, Gemma 4 LiteRT, Gemma 4 ONNX WebGPU, and EmbeddingGemma 2). |
+| **Gallery** | `lib/screens/gallery_search_screen.dart` | Smart Album with search-as-you-type, visual similarity ("find more like this"), and live camera search powered by EmbeddingGemma 2. |
+| **Moments** | `lib/screens/video_moment_screen.dart` | Realtime Video Moment Finder with temporal sliding-window indexing, audio interleaving, and timeline scrubbing. |
+| **Embeds** | `lib/screens/embedding_screen.dart` | Compute semantic embeddings and display cosine-similarity scores between multimodal items. |
+| **Test Runner** | `lib/screens/test_runner_screen.dart` | Built-in test suite executing lifecycle, single-turn, streaming, multimodal (image/audio/PDF), and context-management tests. |
 
 ---
 

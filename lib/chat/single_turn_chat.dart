@@ -101,7 +101,12 @@ class SingleTurnChat {
     final session = await _engine.createSession(config: effectiveConfig);
 
     try {
-      final parts = _buildParts(prompt, images, audios);
+      final parts = _buildParts(
+        prompt,
+        images,
+        audios,
+        systemPrompt: effectiveConfig.systemPrompt,
+      );
       await for (final chunk in session.generateResponseStream(parts)) {
         yield chunk;
       }
@@ -232,12 +237,22 @@ class SingleTurnChat {
   List<ContentPart> _buildParts(
     String text,
     List<Uint8List>? images,
-    List<Uint8List>? audios,
-  ) {
+    List<Uint8List>? audios, {
+    String? systemPrompt,
+  }) {
     final parts = <ContentPart>[];
     if (images != null) for (final img in images) parts.add(ImagePart(img));
     if (audios != null) for (final aud in audios) parts.add(AudioPart(aud));
-    if (text.isNotEmpty) parts.add(TextPart(text));
+    if (text.isNotEmpty) {
+      String formattedText = text;
+      if (kIsWeb && !text.contains('<start_of_turn>')) {
+        final sysPrefix = (systemPrompt != null && systemPrompt.isNotEmpty)
+            ? '<start_of_turn>system\n$systemPrompt<end_of_turn>\n'
+            : '';
+        formattedText = '$sysPrefix<start_of_turn>user\n$text<end_of_turn>\n<start_of_turn>model\n';
+      }
+      parts.add(TextPart(formattedText));
+    }
     return parts;
   }
 

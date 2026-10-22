@@ -8,11 +8,15 @@
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_gemma/flutter_local_gemma.dart';
-import 'package:flutter_local_gemma/helpers/model_loader.dart';
-import 'package:flutter_local_gemma/model_picker/model_picker.dart';
 import '../app_state.dart';
 
 const _hfToken = 'hf_YOUR_TOKEN_HERE';
+
+String? _getEffectiveToken() {
+  final mgrToken = ModelManager.instance.hfToken;
+  if (mgrToken != null && mgrToken.isNotEmpty) return mgrToken;
+  return _hfToken.contains('YOUR_TOKEN') ? null : _hfToken;
+}
 
 /// Downloads (if needed) and initialises the LLM engine.
 ///
@@ -46,11 +50,14 @@ Future<void> loadLlm({
       networkUrl: model != null
           ? (kIsWeb ? model.webUrl : model.androidUrl)
           : null,
-      token: _hfToken,
+      token: _getEffectiveToken(),
       maxTokens: mgr.maxTokens + 1024,
       useGpu: mgr.useGpu,
       enableMtp: enableMtp,
       supportAudio: mgr.supportAudio,
+      modelName: model != null
+          ? (kIsWeb ? model.webFile : model.androidFile)
+          : null,
       onProgress: (p) {
         onProgress?.call(p);
         // Switch status label once download finishes
@@ -79,6 +86,8 @@ Future<void> unloadLlm() async {
 /// Downloads (if needed) and initialises the embedding engine.
 Future<void> loadEmbedding({
   bool local = false,
+  GemmaModel? model,
+  bool preferChipsetVariant = false,
   void Function(double)? onProgress,
 }) async {
   final mgr = ModelManager.instance;
@@ -92,21 +101,41 @@ Future<void> loadEmbedding({
         mgr.setEmbeddingStatus(ModelStatus.unloaded);
         return;
       }
-      await PluginModelLoader.initEmbedding(
-        modelPath: localPath,
-        useGpu: mgr.useGpu,
-        token: _hfToken,
-      );
+      mgr.embeddingModelPath = localPath;
+      if (model?.isEmbedding == true || localPath.endsWith('.litertlm')) {
+        await PluginModelLoader.initEmbeddingGemma2(
+          modelPathOrId: localPath,
+          token: _getEffectiveToken(),
+        );
+      } else {
+        await PluginModelLoader.initEmbedding(
+          modelPath: localPath,
+          useGpu: mgr.useGpu,
+          token: _getEffectiveToken(),
+        );
+      }
     } else {
       mgr.setEmbeddingStatus(ModelStatus.downloading, error: null);
-      await PluginModelLoader.loadEmbedding(
-        token: _hfToken,
-        useGpu: mgr.useGpu,
-        onProgress: (p) {
-          onProgress?.call(p);
-          if (p >= 100) mgr.setEmbeddingStatus(ModelStatus.loading);
-        },
-      );
+      if (model == null || model == GemmaModel.embeddingGemma2) {
+        final path = await PluginModelLoader.loadEmbeddingGemma2(
+          token: _getEffectiveToken(),
+          preferChipsetVariant: preferChipsetVariant,
+          onProgress: (p) {
+            onProgress?.call(p);
+            if (p >= 100) mgr.setEmbeddingStatus(ModelStatus.loading);
+          },
+        );
+        mgr.embeddingModelPath = path;
+      } else {
+        await PluginModelLoader.loadEmbedding(
+          token: _getEffectiveToken(),
+          useGpu: mgr.useGpu,
+          onProgress: (p) {
+            onProgress?.call(p);
+            if (p >= 100) mgr.setEmbeddingStatus(ModelStatus.loading);
+          },
+        );
+      }
     }
 
     mgr.setEmbeddingStatus(ModelStatus.ready);
@@ -116,11 +145,25 @@ Future<void> loadEmbedding({
   }
 }
 
+/// Downloads (if needed) and initialises the EmbeddingGemma 2 engine.
+Future<void> loadEmbeddingGemma2({
+  bool local = false,
+  bool preferChipsetVariant = false,
+  void Function(double)? onProgress,
+}) =>
+    loadEmbedding(
+      local: local,
+      model: GemmaModel.embeddingGemma2,
+      preferChipsetVariant: preferChipsetVariant,
+      onProgress: onProgress,
+    );
+
 /// Unloads the embedding engine.
 Future<void> unloadEmbedding() async {
   final mgr = ModelManager.instance;
   try {
     await PluginModelLoader.unloadEmbedding();
+    mgr.embeddingModelPath = null;
     mgr.setEmbeddingStatus(ModelStatus.unloaded);
   } catch (e) {
     mgr.setEmbeddingStatus(ModelStatus.error, error: e.toString());

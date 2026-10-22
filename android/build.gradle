@@ -2,7 +2,7 @@ group = "com.example.flutter_local_gemma"
 version = "1.0-SNAPSHOT"
 
 buildscript {
-    ext.kotlin_version = "2.2.20"
+    ext.kotlin_version = "2.4.0"
     repositories {
         google()
         mavenCentral()
@@ -36,7 +36,6 @@ apply plugin: "kotlin-android"
 
 android {
     namespace = "com.example.flutter_local_gemma"
-
     compileSdk = 36
 
     compileOptions {
@@ -57,25 +56,49 @@ android {
         minSdk = 24
     }
 
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            pickFirsts.add("**/liblitertlm_jni.so")
+            pickFirsts.add("**/libc++_shared.so")
+            pickFirsts.add("**/libsqlite_vector_store_jni.so")
+        }
+    }
+
     dependencies {
         testImplementation("org.jetbrains.kotlin:kotlin-test")
         testImplementation("org.mockito:mockito-core:5.0.0")
-        
+
         // Required for gemma 3 and used in embedding too
         // Core LiteRT-LM for Gemma 3 & 4
-        implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0")
-        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-        implementation("com.google.mediapipe:tasks-genai:0.10.21")
-        implementation("com.google.mediapipe:tasks-vision:0.10.21")
+        // 0.14.0 adds EngineConfig.cacheDir (GPU shader/kernel cache) and the
+        // Content.ImageFile / Content.AudioFile zero-copy content types.
+        // 0.18.0 matches Google AI Edge Gallery and provides ActivationDataType,
+        // which MediaPipe tasks-retrieval's UniversalEmbedder requires at runtime.
+        implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
+        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+        implementation("com.google.mediapipe:tasks-genai:0.10.35")
+        implementation("com.google.mediapipe:tasks-vision:0.10.35")
+
+        // MediaPipe Tasks Retrieval for UniversalEmbedder and SemanticRetriever
+        implementation("com.google.mediapipe:tasks-retrieval:1.1.0")
+
+        // Media3 for video processing and audio extraction
+        implementation("androidx.media3:media3-exoplayer:1.5.1")
+        implementation("androidx.media3:media3-transformer:1.5.1")
+        implementation("androidx.media3:media3-ui:1.5.1")
 
         // WebView asset loading for JS skill execution
-        implementation("androidx.webkit:webkit:1.12.1")
+        implementation("androidx.webkit:webkit:1.16.0")
+
+        // DocumentFile for SAF folder traversal
+        implementation("androidx.documentfile:documentfile:1.0.1")
 
         // Required only for embedding
         implementation("com.google.ai.edge.localagents:localagents-rag:0.3.0")
 
         // Old deviced pdf text extraction
-        implementation("com.github.librepdf:openpdf:3.0.0")
+        implementation("com.github.librepdf:openpdf:3.0.5")
 
         implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.10.2")
     }

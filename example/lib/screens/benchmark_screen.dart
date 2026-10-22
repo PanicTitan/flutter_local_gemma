@@ -75,7 +75,7 @@ class _BenchmarkScreenState extends State<BenchmarkScreen> {
           await FlutterLocalGemma().init(InferenceConfig(
             modelPath:    path,
             maxTokens:    mgr.maxTokens,
-            backend:      kIsWeb ? null : (mgr.useGpu ? PreferredBackend.gpu : PreferredBackend.cpu),
+            backend:      kIsWeb ? PreferredBackend.gpu : (mgr.useGpu ? PreferredBackend.gpu : PreferredBackend.cpu),
             supportAudio: false,
           ));
         });

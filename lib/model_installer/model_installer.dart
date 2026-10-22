@@ -15,7 +15,10 @@ class ModelInstaller {
   /// Downloads [url] into the platform model cache directory.
   ModelDownloaderBuilder fromNetwork(String url, {String? token, String? directoryPath}) {
     final name = url.split('/').last.split('?').first;
-    return createDownloader(url, name.isNotEmpty ? name : _fileName,
+    final resolvedName = (_fileName != 'gemma-model.litertlm' && _fileName.isNotEmpty)
+        ? _fileName
+        : (name.isNotEmpty ? name : _fileName);
+    return createDownloader(url, resolvedName,
         token: token, directoryPath: directoryPath);
   }
 
@@ -53,6 +56,14 @@ class ModelInstaller {
       return [];
     }
   }
+
+  /// **Web only.** Checks if an ONNX model is in browser Cache Storage.
+  static Future<bool> isTransformersModelCached(String pattern) =>
+      isTransformersModelCachedImpl(pattern);
+
+  /// **Web only.** Deletes cached files for an ONNX model from Cache Storage.
+  static Future<bool> deleteTransformersModel(String pattern) =>
+      deleteTransformersModelImpl(pattern);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -26,8 +26,16 @@ Version 2 introduces a complete architectural rebuild from v1 to support **Gemma
 |---------|---------|-----|
 | Gemma 3n E2B (text + vision + audio) | ✅ | ✅ |
 | Gemma 3n E4B (text + vision + audio) | ✅ | ✅ |
-| Gemma 4 E2B (text + vision + tools + thinking) | ✅ | ⚠️ (No Vision/Audio)* |
-| Gemma 4 E4B (text + vision + tools + thinking) | ✅ | ⚠️ (No Vision/Audio)* |
+| Gemma 4 E2B LiteRT (text + tools + thinking) | ✅ | ✅ (Text-only; Vision/Audio skipped)¹ |
+| Gemma 4 E4B LiteRT (text + tools + thinking) | ✅ | ✅ (Text-only; Vision/Audio skipped)¹ |
+| Gemma 4 E2B ONNX (text + vision + audio + thinking) | ✅ (Fallback) | ✅ (Full Multimodal via WebGPU)² |
+| Gemma 4 E4B ONNX (text + vision + audio + thinking) | ✅ (Fallback) | ✅ (Full Multimodal via WebGPU)² |
+| EmbeddingGemma 2 (multimodal text/image/audio) | ✅ (LiteRT/MediaPipe) | ✅ (Transformers.js/WebGPU) |
+| Smart Album / Instant Media Gallery Search | ✅ | ✅ |
+| Visual Similarity & Live Camera Search | ✅ | ✅ |
+| Realtime Video Moment Finder (Sliding Window + Audio) | ✅ | ✅ |
+| On-Device Vector Store (MediaPipe SqliteVectorStore) | ✅ (Sqlite / Native) | ✅ (SIMD / OPFS) |
+| Matryoshka Dimension Truncation (768/512/256/128) | ✅ | ✅ |
 | `GemmaLoader` — one-liner model lifecycle helper | ✅ | ✅ |
 | `BaseChat` — polymorphic interface for `GemmaChat`/`AgentChat` | ✅ | ✅ |
 | `sealed GemmaSkill` + `GemmaSkillList` typedef | ✅ | ✅ |
@@ -43,11 +51,12 @@ Version 2 introduces a complete architectural rebuild from v1 to support **Gemma
 | Tools — JS skills (Gallery-compatible) | ✅ | ✅ |
 | `AgentChat` — high-level agentic loop | ✅ | ✅ |
 | Embeddings (Gemma 300M, 768-dim) | ✅ | ✅ |
-| PDF extraction (text + images) | ✅ | ✅ |
+| PDF extraction (text + images) | ✅ | ✅ (PDF.js v6.4.299) |
 | RAG helper (PDF → embeddings) | ✅ | ✅ |
 
-> **Gemma 4 Web Multimodality Note:** Gemma 4 currently lacks vision and audio support on the Web target due to missing multimodal adapters in LiteRT-LM Web. For more details, see [LiteRT-LM Issue #2150](https://github.com/google-ai-edge/LiteRT-LM/issues/2150).
-> **Gemma 3 Agentic Note:** Gemma 3 now supports skills/tool calls via prompt-based (non-native) mode on all platforms. However, Gemma 3 does **not** support Thinking mode (only Gemma 4 supports thinking).
+> ¹ **Gemma 4 LiteRT Web Note:** The standard LiteRT-LM Web runtime (`.task` models) currently lacks image/audio calculator graphs in the browser WASM build. The plugin automatically detects this via `currentModelSupportsVision` / `currentModelSupportsAudio` and gracefully skips multimodal inputs and test cases without failing or hanging.
+> ² **Gemma 4 ONNX Web Note:** For full in-browser multimodal inference (text, image, and audio input), use the ONNX models (`gemma4E2BOnnx` / `gemma4E4BOnnx`). They run via Transformers.js (`@huggingface/transformers`) accelerated by WebGPU with automatic Cache Storage caching.
+> ³ **Gemma 3 Agentic Note:** Gemma 3 supports skills/tool calls via prompt-based (non-native) mode on all platforms. However, Gemma 3 does **not** support Thinking mode (only Gemma 4 supports thinking).
 
 ---
 
@@ -62,6 +71,7 @@ Version 2 introduces a complete architectural rebuild from v1 to support **Gemma
 - [API Reference](#api-reference)
   - [GemmaLoader — Model Lifecycle Helper](#gemmaloader--model-lifecycle-helper)
   - [Loading a Model (Low Level)](#loading-a-model-low-level)
+  - [State Management — GemmaState](#state-management--gemmastate)
   - [GemmaChat — Multi-turn Chat](#gemmachat--multi-turn-chat)
   - [BaseChat — Polymorphic Interface](#basechat--polymorphic-interface)
   - [Thinking Mode](#thinking-mode)
@@ -73,7 +83,14 @@ Version 2 introduces a complete architectural rebuild from v1 to support **Gemma
   - [ToolCallParser](#toolcallparser)
   - [ChatHistoryMixin](#chathistorymixin)
   - [Structured JSON Output](#structured-json-output)
-  - [Embeddings](#embeddings)
+  - [Embeddings & EmbeddingGemma 2](#embeddings--embeddinggemma-2)
+    - [EmbeddingGemma 2 Model Setup](#embeddinggemma-2-model-setup)
+    - [Multimodal EmbedPart (Text, Image, Audio)](#multimodal-embedpart-text-image-audio)
+    - [Task Instruction Formatting](#task-instruction-formatting)
+    - [Matryoshka Truncation](#matryoshka-truncation)
+    - [On-Device Vector Store (SemanticRetrievalService)](#on-device-vector-store-semanticretrievalservice)
+  - [Smart Album / Instant Media Gallery Search](#smart-album--instant-media-gallery-search)
+  - [Realtime Video Moment Finder](#realtime-video-moment-finder)
   - [PDF Processing](#pdf-processing)
   - [RAG Helper](#rag-helper)
   - [Model Installer](#model-installer)
@@ -231,6 +248,10 @@ await chat.dispose();
 | `gemma4E2B` | Web | `litert-community/gemma-4-E2B-it-litert-lm` | `gemma-4-E2B-it-web.task` | ~2 GB | ❌ |
 | `gemma4E4B` | Android | `litert-community/gemma-4-E4B-it-litert-lm` | `gemma-4-E4B-it.litertlm` | 3.66 GB | ❌ |
 | `gemma4E4B` | Web | `litert-community/gemma-4-E4B-it-litert-lm` | `gemma-4-E4B-it-web.task` | ~3 GB | ❌ |
+| `gemma4E2BOnnx` | Web | `onnx-community/gemma-4-E2B-it-ONNX` | `gemma-4-E2B-it.onnx` | q4f16 | ❌ |
+| `gemma4E4BOnnx` | Web | `onnx-community/gemma-4-E4B-it-ONNX` | `gemma-4-E4B-it.onnx` | q4f16 | ❌ |
+| `embeddingGemma2` | Android | `litert-community/embeddinggemma-2-740m-litert-lm` | `embeddinggemma-2-740m.litertlm` | 740 MB | ❌ |
+| `embeddingGemma2` | Web | `onnx-community/embeddinggemma-2-ONNX` | `onnx/model_q4.onnx` | 405 MB | ❌ |
 
 Use the `GemmaModel` enum to reference models and get their platform-appropriate URLs:
 
@@ -247,16 +268,18 @@ print(model.sizeDescription);  // '2.6 GB  •  Open'
 
 ### Capability Matrix
 
-| Model | Text | Vision | Audio | Tools | Thinking | MTP (Android) |
-|-------|------|--------|-------|-------|----------|---------------|
-| Gemma 3n E2B | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Gemma 3n E4B | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Gemma 4 E2B | ✅ | ✅ ¹ | ✅ ¹ | ✅ ¹ | ✅ | ✅ |
-| Gemma 4 E4B | ✅ | ✅ ¹ | ❌ | ✅ ¹ | ✅ | ✅ |
+| Model | Text | Vision | Audio | Tools | Thinking | MTP (Android) | Primary Backend |
+|-------|------|--------|-------|-------|----------|---------------|-----------------|
+| Gemma 3n E2B | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | LiteRT / MediaPipe |
+| Gemma 3n E4B | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | LiteRT / MediaPipe |
+| Gemma 4 E2B LiteRT | ✅ | ✅ (Android only)¹ | ✅ (Android only)¹ | ✅ ¹ | ✅ | ✅ | LiteRT-LM / MediaPipe |
+| Gemma 4 E4B LiteRT | ✅ | ✅ (Android only)¹ | ❌ | ✅ ¹ | ✅ | ✅ | LiteRT-LM / MediaPipe |
+| Gemma 4 E2B ONNX | ✅ | ✅ (Full Web & Mobile)² | ✅ (Full Web & Mobile)² | ✅ | ✅ | ❌ | Transformers.js (WebGPU) |
+| Gemma 4 E4B ONNX | ✅ | ✅ (Full Web & Mobile)² | ✅ (Full Web & Mobile)² | ✅ | ✅ | ❌ | Transformers.js (WebGPU) |
+| EmbeddingGemma 2 | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | MediaPipe (Android) / ONNX (Web) |
 
-> ¹ **Gemma 4 vision/audio and tools are mutually exclusive.** When `skills` are set in `SessionConfig`,
-> multimodality is automatically suppressed (debug warning logged, no exception). Setting
-> `enableMultimodality: false` also suppresses image/audio input.
+> ¹ **Gemma 4 LiteRT vision/audio and tools note:** On Android, vision/audio and tools are mutually exclusive in LiteRT-LM. On Web, standard LiteRT `.task` models run text-only (vision and audio requests are skipped).
+> ² **Gemma 4 ONNX Web multimodal support:** ONNX models run in the browser using `@huggingface/transformers` backed by WebGPU with full support for image files (`ImagePart`) and audio files (`AudioPart`).
 
 ---
 
@@ -265,6 +288,11 @@ print(model.sizeDescription);  // '2.6 GB  •  Open'
 ### GemmaLoader — Model Lifecycle Helper
 
 `GemmaLoader` wraps `ModelInstaller` and `FlutterLocalGemma` to provide a single-call model lifecycle API:
+
+> `loadGemmaModel` safely swaps models: if a different model is already loaded, it's disposed
+> before the new one loads (no-ops if you pass the same model already loaded). See
+> [Safely switching models](#safely-switching-models) below. It also tracks
+> `GemmaState.instance.loadState` throughout, including a `downloading` phase.
 
 ```dart
 import 'package:flutter_local_gemma/flutter_local_gemma.dart';
@@ -340,6 +368,129 @@ await gemma.init(InferenceConfig(
 > **MTP (Speculative Decoding):** For Gemma 4 Android models, MTP is **automatically enabled** when
 > the model file contains the MTP drafter shard (shard #9, ~43 MB). This is auto-detected at engine
 > init time — no flag needed from your code.
+
+---
+
+### State Management — GemmaState
+
+`GemmaState` is a reactive, read-only snapshot of what the plugin is doing right now — model
+loading and per-turn generation activity. Since `FlutterLocalGemma` is a singleton and the native
+engine can only ever have one model loaded and one turn generating at a time, a single global
+`GemmaState.instance` is all that's needed; there's no per-session state to juggle.
+
+Both properties are plain `ValueListenable`s — the same primitive `ValueListenableBuilder` already
+uses everywhere in Flutter — so wiring them up is standard Flutter, no new concepts:
+
+```dart
+import 'package:flutter_local_gemma/flutter_local_gemma.dart';
+
+// Declarative: rebuild a widget automatically when the state changes.
+ValueListenableBuilder<ModelLoadState>(
+  valueListenable: GemmaState.instance.loadState,
+  builder: (context, state, _) => Text('Model: ${state.name}'),
+)
+
+ValueListenableBuilder<GemmaInferenceState>(
+  valueListenable: GemmaState.instance.inferenceState,
+  builder: (context, state, _) => switch (state) {
+    GemmaInferenceState.idle          => const Icon(Icons.circle_outlined),
+    GemmaInferenceState.processingInput => const Text('Sending…'),
+    GemmaInferenceState.thinking      => const Text('Thinking…'),
+    GemmaInferenceState.answering     => const Text('Answering…'),
+    GemmaInferenceState.toolCalling   => const Text('Using a tool…'),
+    GemmaInferenceState.cancelling    => const Text('Stopping…'),
+    GemmaInferenceState.error         => const Icon(Icons.error_outline),
+  },
+)
+
+// Imperative: react to a change without rebuilding anything (e.g. to drive
+// a foreground service, a wake lock, or a "keep this tab alive" hack — see
+// the example app's lib/services/foreground_task_controller*.dart).
+GemmaState.instance.inferenceState.addListener(() {
+  final busy = GemmaState.instance.isBusy; // true whenever state != idle
+  busy ? startMyForegroundThing() : stopMyForegroundThing();
+});
+```
+
+#### `ModelLoadState`
+
+Covers **both** downloading and native engine loading — the full pipeline from "nothing on disk"
+to "ready to generate":
+
+| Value | Meaning |
+|---|---|
+| `notLoaded` | No model loaded and nothing downloading. Initial state, and the state after a successful `dispose()`. |
+| `downloading` | A model file is being downloaded (via `ModelInstaller`, `PluginModelLoader.downloadLlm`/`switchLlm`/`switchToLlm`, or `GemmaLoader.loadGemmaModel`) — *before* the native engine starts initialising. |
+| `loading` | `FlutterLocalGemma.init()` is in progress (file resolution, engine init, GPU delegate setup — can take seconds to tens of seconds for a cold multi-GB load). |
+| `loaded` | Engine is ready — sessions can be created and generation can start. |
+| `unloading` | `FlutterLocalGemma.dispose()` is in progress. |
+| `error` | The last download, `init()`, or `dispose()` call threw. Check `GemmaState.instance.lastError`. Call `dispose()` (safe even after a failed init) then `init()` again to retry. |
+
+> Calling `FlutterLocalGemma.init()` directly only ever resolves an already-local file — it never
+> downloads, so it can't report `downloading` itself. That state is set by whichever helper
+> downloads the file first (`PluginModelLoader.downloadLlm`/`loadLlm`/`switchLlm`/`switchToLlm`, or
+> `GemmaLoader.loadGemmaModel`) — use one of those rather than driving `ModelInstaller` + `init()`
+> manually if you want the download phase reflected in `GemmaState` too.
+
+#### `GemmaInferenceState`
+
+| Value | Meaning |
+|---|---|
+| `idle` | Not generating anything. |
+| `processingInput` | Prompt/context is being pushed to the native side, just before generation starts. |
+| `thinking` | Streaming `<think>`/`<|channel>thought…` content (Gemma 4 thinking mode). Only distinguishable from `answering` via `GemmaChat.sendMessageResponseStream` or `AgentChat.run` — the plain string-based `sendMessageStream`/`generateResponseStream` only ever report `answering` while busy, since raw text alone can't be split into thinking vs. answer. |
+| `answering` | Streaming the final answer tokens. |
+| `toolCalling` | `AgentChat` has dispatched a tool/skill call and is waiting on its result — covers both the Dart-side parsed tool-call loop and native (`nativeToolCalling: true`) tool dispatch. |
+| `cancelling` | `stopGeneration()`/`ChatSession.stopGeneration()` was called; resolves back to `idle` once the stream actually closes. |
+| `error` | The last generation turn ended with an error. Check `GemmaState.instance.lastError`. |
+
+`GemmaState` also exposes:
+- `isBusy` — `true` whenever `inferenceState != idle`. The one flag you need for "is the model doing anything right now."
+- `isModelLoaded` — `true` whenever `loadState == loaded`.
+- `isLoadBusy` — `true` whenever `loadState` is `downloading`, `loading`, or `unloading`. Handy for disabling a "load"/"switch model" button so it can't race an operation already in progress.
+- `lastError` — a `ValueListenable<Object?>` with the error from the last failed load or generation, or `null`.
+- `listenable` — a merged `Listenable` that fires on *either* `loadState` or `inferenceState` changing, for a single callback that reacts to any plugin activity.
+
+State tracking works identically on Android and Web — both funnel through the same instrumented
+code paths (`ChatSession.generateResponseStream`, `FlutterLocalGemma.computeSingle`, `AgentChat.run`),
+so there's no platform-specific setup required.
+
+> **Note:** all the mutating methods on `GemmaState` (`setLoadState`, `setInferenceState`,
+> `setLastError`) are marked `@internal` — only the package itself calls them. Application code
+> should only ever read the `ValueListenable`s above.
+
+#### Safely switching models
+
+`FlutterLocalGemma.init()` is a no-op if a model is already loaded — calling it again with a
+*different* model path silently does nothing natively, leaving the old model running while your
+UI thinks the new one is active. Both of the package's model-loading helpers handle this safely,
+so prefer either of them over driving `init()` directly whenever the user can pick a different
+model while one may already be loaded:
+
+- **`GemmaLoader.loadGemmaModel(model, ...)`** (the `GemmaModel`-catalog API — see
+  [GemmaLoader](#gemmaloader--model-lifecycle-helper)) disposes the currently-loaded model first if
+  `model` differs from it, before downloading/initialising the new one. No-ops if `model` is
+  already loaded (pass `forceReload: true` to force a reload anyway).
+- **`PluginModelLoader.switchLlm`/`switchToLlm`** (the raw-path API, same package) do the same for
+  a manually-resolved path:
+
+```dart
+// Already downloaded a local path:
+await PluginModelLoader.switchLlm(
+  path: newModelPath,
+  maxTokens: 4096,
+  useGpu: true,
+);
+
+// Download (if needed) + safely switch in one call — same signature as loadLlm:
+await PluginModelLoader.switchToLlm(
+  networkUrl: newModelUrl,
+  onProgress: (p) => print('${p.toStringAsFixed(0)}%'),
+);
+```
+
+Both throw a clear `StateError` (check `GemmaState.instance.isLoadBusy` in your UI) instead of
+racing an in-flight download/load/unload, rather than corrupting state silently.
 
 ---
 
@@ -947,33 +1098,188 @@ await chat.sendMessageJsonStream(
 
 ---
 
-### Embeddings
+### Embeddings & EmbeddingGemma 2
+
+`flutter_local_gemma` provides full support for Google's **EmbeddingGemma 2** multimodal retrieval model across **Android** (via MediaPipe Tasks Retrieval + LiteRT-LM) and **Web** (via Transformers.js + WebGPU / WASM + OPFS caching).
+
+#### EmbeddingGemma 2 Model Setup
 
 ```dart
 import 'package:flutter_local_gemma/flutter_local_gemma.dart';
 
-// (Initialise engine with an embedding model first)
+// Option A: Using ModelLoader convenience helper
+final embedder = await ModelLoader.loadEmbeddingGemma2(
+  modelPathOrId: 'onnx-community/embeddinggemma-2-ONNX', // Web ID or Android .litertlm file path
+  targetDimension: 768, // 768, 512, 256, or 128
+);
+
+// Option B: Using EmbeddingConfig
 final plugin = EmbeddingPlugin();
-final vector = await plugin.getEmbedding('Hello world');
-print(vector.length); // 768
+await plugin.init(EmbeddingConfig.gemma2(
+  modelPathOrId: '/path/to/embeddinggemma2.litertlm',
+  targetDimension: 256, // Matryoshka dimension
+));
+```
+
+#### Multimodal EmbedPart (Text, Image, Audio)
+
+EmbeddingGemma 2 supports interleaved multimodal sequences. You can combine text tokens, image frames, and 16 kHz mono 16-bit PCM audio slices into a single embedding vector:
+
+```dart
+final parts = [
+  EmbedPart.text('00:03'),
+  EmbedPart.image(frameJpegBytes),
+  EmbedPart.audio(pcm16kHzSamples), // Int16List mono @ 16,000 Hz
+];
+
+final vector = await plugin.getEmbeddingFromParts(parts);
+print('Multimodal embedding dimension: ${vector.length}'); // 768 (or Matryoshka dim)
+```
+
+#### Task Instruction Formatting
+
+EmbeddingGemma 2 uses specialized instruction prefixes to achieve state-of-the-art asymmetric retrieval accuracy:
+
+```dart
+// Asymmetric Search Query: "task: search result | query: red vintage bicycle"
+final queryPrompt = formatEmbeddingText(
+  'red vintage bicycle',
+  taskType: EmbeddingTaskType.retrievalQuery,
+);
+final queryVector = await plugin.getEmbedding(queryPrompt);
+
+// Asymmetric Document / Corpus Item: "title: Bicycle Catalog | text: Vintage red road bike..."
+final docPrompt = formatEmbeddingText(
+  'Vintage red road bike with leather saddle.',
+  taskType: EmbeddingTaskType.retrievalDocument,
+  title: 'Bicycle Catalog',
+);
+final docVector = await plugin.getEmbedding(docPrompt);
+```
+
+Supported task types:
+- `EmbeddingTaskType.retrievalQuery`
+- `EmbeddingTaskType.retrievalDocument`
+- `EmbeddingTaskType.questionAnswering`
+- `EmbeddingTaskType.factChecking`
+- `EmbeddingTaskType.codeRetrieval`
+- `EmbeddingTaskType.classification`
+- `EmbeddingTaskType.clustering`
+- `EmbeddingTaskType.sentenceSimilarity`
+- `EmbeddingTaskType.none`
+
+#### Matryoshka Truncation
+
+EmbeddingGemma 2 supports Matryoshka Representation Learning (MRL), allowing you to safely truncate 768-dimensional embeddings down to 512, 256, or 128 dimensions while preserving up to 98% retrieval quality:
+
+```dart
+// Truncate to 256 dimensions and automatically re-normalize with L2 norm
+final compactVector = truncateMatryoshka(vector, 256);
+print(compactVector.length); // 256
 
 // Cosine similarity helper
-import 'dart:math';
-double cosineSimilarity(List<double> a, List<double> b) {
-  double dot = 0, normA = 0, normB = 0;
-  for (int i = 0; i < a.length; i++) {
-    dot   += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  return dot / (sqrt(normA) * sqrt(normB));
+final score = cosineSimilarity(queryVector, docVector);
+print('Similarity score: ${(score * 100).toStringAsFixed(1)}%');
+```
+
+#### On-Device Vector Store (SemanticRetrievalService)
+
+`SemanticRetrievalService` provides a cross-platform vector database powered natively by MediaPipe's `SqliteVectorStore` on Android and an optimized SIMD/Float32 in-memory vector store on Web:
+
+```dart
+final retrievalService = SemanticRetrievalService(databaseName: 'my_photos_gemma.db');
+await retrievalService.initialize();
+
+// Index images in batch
+await retrievalService.addRecords([
+  (
+    id: 'photo_101',
+    images: [imageBytes],
+    metadata: {'date': '2026-05-12', 'folder': 'Vacation'},
+  ),
+]);
+
+// Search using natural language text query
+final results = await retrievalService.retrieveEntities(
+  'golden retriever playing in the grass',
+  limit: 10,
+);
+
+for (final match in results) {
+  print('Photo ID: ${match.id}, Score: ${match.similarityScore}');
+}
+```
+
+---
+
+### Smart Album / Instant Media Gallery Search
+
+`GallerySearchService` implements Google Edge AI Gallery's Smart Album features: search-as-you-type, visual similarity search, live camera search, and native folder selection.
+
+```dart
+final galleryService = GallerySearchService(retrievalService: retrievalService);
+await galleryService.initialize();
+
+// 1. Search-as-you-type
+await galleryService.searchPhotos('sunset over the ocean');
+print('Found ${galleryService.searchResults.length} matches');
+
+// 2. Visual similarity search ("Find more like this")
+await galleryService.searchSimilarToAsset(selectedAsset);
+
+// 3. Live camera search ("Search-as-you-see")
+await galleryService.searchByCameraFrame(cameraPreviewJpegBytes);
+
+// 4. Folder selection & indexing
+final folder = await GemmaModelPicker.pickFolder();
+if (folder != null) {
+  final files = await GemmaModelPicker.listFilesInFolder(folder.path);
+  // Index files into vector database
+}
+```
+
+---
+
+### Realtime Video Moment Finder
+
+`VideoMomentService` implements Google Edge AI Gallery's Realtime Video Moment Finder. It splits video files into sliding temporal windows, optionally interleaves synchronized 16 kHz audio PCM slices, and clusters search matches into continuous timeline intervals:
+
+```dart
+final momentService = VideoMomentService(retrievalService: retrievalService);
+
+// 1. Index video with sliding window chunking & audio interleaving
+await momentService.indexVideo(
+  videoPath: '/path/to/video.mp4',
+  displayName: 'Family Vacation.mp4',
+  durationMs: 120000,
+  windowDurationSec: 3,     // 3-second windows
+  framesPerWindow: 2,       // 2 sample frames per window
+  overlapDurationSec: 1,    // 1-second sliding overlap
+  includeAudio: true,       // Interleave 16 kHz mono audio PCM
+  extractFrames: (startMs, endMs, count) async {
+    // Extract thumbnail frames at specified timestamps
+    return [frame1Bytes, frame2Bytes];
+  },
+  extractAudioPcm: (startMs, endMs) async {
+    // Extract 16 kHz mono 16-bit PCM audio chunk
+    return audioPcmSamples;
+  },
+);
+
+// 2. Search for natural language moments
+await momentService.searchMoments(
+  query: 'dog catching a frisbee in the park',
+  topK: 5,
+);
+
+// 3. Highlighted timeline intervals & scrubber navigation
+for (final interval in momentService.mergedIntervals) {
+  print('Match interval: ${interval.startTimeMs}ms - ${interval.endTimeMs}ms');
 }
 
-final sim = cosineSimilarity(
-  await plugin.getEmbedding('What is the capital of France?'),
-  await plugin.getEmbedding('Paris is the capital city of France.'),
-);
-print(sim); // ~0.92
+// 4. Save/bookmark matching moment clip
+final topMoment = momentService.searchResults.first;
+momentService.saveMomentClip(topMoment);
 ```
 
 ---
@@ -1017,6 +1323,8 @@ PdfExtractionConfig(
   endPage: 5,
 )
 ```
+
+> **Web Implementation Note:** On Web, PDF extraction uses Mozilla's `pdfjs-dist` (pinned to v6.4.299). The PDF worker scripts (`pdf.worker.mjs`, `pdf.worker.min.mjs`) are bundled directly within the plugin assets (`web/pdfjs-dist/`), eliminating external CDN dependencies and preventing API/worker version mismatches.
 
 ---
 
@@ -1063,12 +1371,18 @@ final path2 = await installer.fromXFile(pickedFile);
 // Web only: install from a JS Blob (streaming copy to OPFS, zero extra RAM)
 final path3 = await installer.fromWebBlob(jsBlob);
 
-// Delete all cached files
+// Delete all cached files (clears OPFS on Web, documents directory on Android, and Cache Storage)
 final freedBytes = await ModelInstaller.purgeCache();
 
 // Web only: list OPFS cached files
 final files = await ModelInstaller.listWebCache();
 // [{'name': 'gemma-4-E2B-it-web.task', 'size': 2720000000}]
+
+// Web only: check if an ONNX model (Transformers.js) is cached in Cache Storage
+final isCached = await ModelInstaller.isTransformersModelCached('gemma-4-E2B-it-ONNX');
+
+// Web only: delete a specific Transformers.js model from Cache Storage
+await ModelInstaller.deleteTransformersModel('gemma-4-E2B-it-ONNX');
 ```
 
 ---

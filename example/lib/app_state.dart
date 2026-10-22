@@ -42,10 +42,19 @@ class ModelManager extends ChangeNotifier {
   String?     llmError;
   String?     llmModelPath;
 
+  // ── Authentication Token ──────────────────────────────────────────────────
+  String?     hfToken;
+
+  void setHfToken(String? token) {
+    hfToken = token?.trim().isEmpty == true ? null : token?.trim();
+    notifyListeners();
+  }
+
   // ── Embedding ─────────────────────────────────────────────────────────────
 
   ModelStatus embeddingStatus = ModelStatus.unloaded;
   String?     embeddingError;
+  String?     embeddingModelPath;
 
   // ── Engine settings (require model reload) ────────────────────────────────
 
@@ -134,6 +143,8 @@ class ModelManager extends ChangeNotifier {
   Future<String> purgeCache() async {
     try {
       final bytesFreed = await ModelInstaller.purgeCache();
+      llmModelPath = null;
+      embeddingModelPath = null;
       notifyListeners();
       return 'Freed ${_formatBytes(bytesFreed)}';
     } catch (e) {

@@ -1,5 +1,3 @@
-import 'package:flutter/foundation.dart';
-
 /// Base class for all blocks parsed from a raw Gemma response string.
 sealed class GemmaContentBlock {
   final String content;

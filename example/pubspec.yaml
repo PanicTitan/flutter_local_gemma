@@ -23,6 +23,13 @@ dependencies:
   image_picker: ^1.2.1
   cross_file: ^0.3.5+1
   image: ^4.8.0
+  # Keeps the app process alive while the model is generating/processing:
+  # an Android foreground service via flutter_foreground_task on mobile, a
+  # silent looping <audio> element via package:web on web.
+  # See lib/services/foreground_task_controller*.dart.
+  flutter_foreground_task: ^10.0.0
+  web: ^1.1.0
+  video_player: ^2.14.1
 
 dev_dependencies:
   integration_test:

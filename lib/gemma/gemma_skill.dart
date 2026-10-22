@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart' show rootBundle;
 import '../utils/http_fetch.dart';
 

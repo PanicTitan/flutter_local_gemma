@@ -4,17 +4,19 @@
 // a one-line detail summary that collapses into the row rather than overflowing.
 
 import 'package:flutter/material.dart';
+import 'package:flutter_local_gemma/flutter_local_gemma.dart';
 import '../testing/test_suite.dart';
 import '../app_state.dart';
 
 class TestRunnerScreen extends StatefulWidget {
   const TestRunnerScreen({super.key});
   @override
-  State<TestRunnerScreen> createState() => _TestRunnerScreenState();
+  State<TestRunnerScreen> createState() => TestRunnerScreenState();
 }
 
-class _TestRunnerScreenState extends State<TestRunnerScreen> {
+class TestRunnerScreenState extends State<TestRunnerScreen> {
   late final TestSuite _suite;
+  TestSuite get suite => _suite;
   final ScrollController _scroll = ScrollController();
 
   @override
@@ -24,6 +26,8 @@ class _TestRunnerScreenState extends State<TestRunnerScreen> {
     _suite.ctx.onProgress = (_) { if (mounted) setState(() {}); };
     // Seed the already-loaded model path so tests don't re-download
     _suite.ctx.llmPath ??= ModelManager.instance.llmModelPath;
+    _suite.ctx.embedPath ??= ModelManager.instance.embeddingModelPath ??
+        EmbeddingPlugin().activeConfig?.modelPathOrId;
   }
 
   @override

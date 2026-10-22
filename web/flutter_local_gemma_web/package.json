@@ -17,6 +17,6 @@
         "@litert-lm/core": "^0.13.1",
         "@litertjs/core": "^2.5.2",
         "@mediapipe/tasks-genai": "^0.10.27",
-        "pdfjs-dist": "^6.0.227"
+        "pdfjs-dist": "6.4.299"
     }
 }

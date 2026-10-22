@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import '../types/content_parts.dart';
 import '../gemma/gemma.dart';
 import '../gemma/gemma_response.dart';
+import '../gemma/gemma_state.dart';
 import '../gemma/thinking_parser.dart';
 import '../json_schema/json_repair.dart';
 import '../json_schema/schema.dart';
@@ -383,7 +384,7 @@ CRITICAL RULES:
     String? overrideSystemPrompt,
     bool isHidden = false,
   }) {
-    return ThinkingParser.filterThinkingStream(
+    final typed = ThinkingParser.filterThinkingStream(
       sendMessageStream(
         text: text,
         images: images,
@@ -392,6 +393,17 @@ CRITICAL RULES:
         isHidden: isHidden,
       ),
     );
+    // Refine the generic `answering` state set by the underlying
+    // ChatSession/sendMessageStream into the more specific `thinking` vs
+    // `answering` split, now that we can tell them apart.
+    return typed.map((response) {
+      if (response is GemmaThinkingResponse) {
+        GemmaState.instance.setInferenceState(GemmaInferenceState.thinking);
+      } else if (response is GemmaTextResponse) {
+        GemmaState.instance.setInferenceState(GemmaInferenceState.answering);
+      }
+      return response;
+    });
   }
 
   // ── History management ────────────────────────────────────────────────────
@@ -586,10 +598,38 @@ CRITICAL RULES:
       ),
     );
 
+    // Gemma 4's "thinking" mode (the `<|channel>thought...` output that
+    // ThinkingParser splits out) is only actually activated on Web by a
+    // literal `<|think|>` marker at the very start of the prompt text.
+    // On native, the engine can key off `SessionConfig.enableThinking`
+    // alone — that path is untouched and keeps working exactly as before.
+    // But `_handleWebTurn` builds the prompt manually (it has to: Web has
+    // no native auto-templating), so nothing else ever adds this marker
+    // for Web. AgentChat has always done this in its own constructor
+    // (`effectivePrompt = '<|think|>\n' + effectivePrompt`); plain
+    // GemmaChat never did — which is why enabling "thinking" only ever
+    // worked through AgentChat, and why plain chat on Web could end up
+    // confusing Gemma 4 into hallucinating garbled turn-boundary tokens
+    // instead of using its trained thinking format. Mirrored here, gated
+    // to Web + Gemma 4 + enableThinking only, so Gemma 3 and native are
+    // completely unaffected.
+    var effectiveSystemPrompt = targetPrompt ?? '';
+    if (kIsWeb &&
+        (config?.enableThinking ?? false) &&
+        _engine.currentModelIsGemma4 &&
+        !effectiveSystemPrompt.startsWith('<|think|>')) {
+      // The `!startsWith` guard matters when this GemmaChat is wrapped by
+      // AgentChat: AgentChat's constructor already prepends `<|think|>` to
+      // the system prompt it hands us, before we ever see it here. Without
+      // this guard we'd double-prefix (`<|think|>\n<|think|>\n...`) for
+      // Agent mode, which was already working correctly.
+      effectiveSystemPrompt = '<|think|>\n$effectiveSystemPrompt';
+    }
+
     // Re-inject the system prompt manually in Gemma's chat template format.
-    if (targetPrompt != null && targetPrompt.isNotEmpty) {
+    if (effectiveSystemPrompt.isNotEmpty) {
       await _nativeSession!.addToContext([
-        TextPart('<start_of_turn>system\n$targetPrompt<end_of_turn>\n'),
+        TextPart('<start_of_turn>system\n$effectiveSystemPrompt<end_of_turn>\n'),
       ]);
     }
 

@@ -44,10 +44,11 @@ class FlutterLocalGemmaPlugin : FlutterPlugin, MethodCallHandler, ActivityAware 
     // ── Sub-plugins ───────────────────────────────────────────────────────────
     // Instantiated here so the coordinator owns them, but each registers its own
     // channel inside onAttachedToEngine.
-    private val gemmaPlugin           = GemmaPlugin()
-    private val embeddingPlugin       = EmbeddingPlugin()
-    private val pdfPlugin             = PdfPlugin()
-    private val nativeFilePickerPlugin = NativeFilePickerPlugin()
+    private val gemmaPlugin             = GemmaPlugin()
+    private val embeddingPlugin         = EmbeddingPlugin()
+    private val semanticRetrievalPlugin = SemanticRetrievalPlugin()
+    private val pdfPlugin               = PdfPlugin()
+    private val nativeFilePickerPlugin   = NativeFilePickerPlugin()
 
     // ─────────────────────────────────────────────────────────────────────────
     // FlutterPlugin
@@ -62,6 +63,7 @@ class FlutterLocalGemmaPlugin : FlutterPlugin, MethodCallHandler, ActivityAware 
         // its own channel.
         gemmaPlugin.onAttachedToEngine(binding)
         embeddingPlugin.onAttachedToEngine(binding)
+        semanticRetrievalPlugin.onAttachedToEngine(binding)
         pdfPlugin.onAttachedToEngine(binding)
         nativeFilePickerPlugin.onAttachedToEngine(binding)
     }
@@ -72,6 +74,7 @@ class FlutterLocalGemmaPlugin : FlutterPlugin, MethodCallHandler, ActivityAware 
         // Each sub-plugin is responsible for releasing its own resources.
         gemmaPlugin.onDetachedFromEngine(binding)
         embeddingPlugin.onDetachedFromEngine(binding)
+        semanticRetrievalPlugin.onDetachedFromEngine(binding)
         pdfPlugin.onDetachedFromEngine(binding)
         nativeFilePickerPlugin.onDetachedFromEngine(binding)
     }

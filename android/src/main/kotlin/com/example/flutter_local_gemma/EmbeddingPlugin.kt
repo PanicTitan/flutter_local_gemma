@@ -11,6 +11,11 @@ import com.google.ai.edge.localagents.rag.models.EmbedData
 import com.google.ai.edge.localagents.rag.models.EmbeddingRequest
 import com.google.ai.edge.localagents.rag.models.GemmaEmbeddingModel
 import com.google.common.collect.ImmutableList
+import com.google.mediapipe.tasks.components.containers.AudioData
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
+import com.google.mediapipe.tasks.retrieval.universalembedder.UniversalEmbedder
+import com.google.mediapipe.tasks.retrieval.universalembedder.UniversalEmbedderOptions
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -20,6 +25,9 @@ import kotlinx.coroutines.guava.await
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.sqrt
 
 /**
  * EmbeddingPlugin
@@ -72,6 +80,9 @@ class EmbeddingPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
         /** Copy-buffer size: 4 MB — embedding models are small, no need for 8 MB. */
         private const val COPY_BUFFER_BYTES = 4 * 1024 * 1024
+
+        @Volatile
+        internal var activeUniversalEmbedder: UniversalEmbedder? = null
     }
 
     // ── Flutter channels ──────────────────────────────────────────────────────
@@ -90,6 +101,10 @@ class EmbeddingPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /** Non-null only between a successful `initEmbeddingModel` and `closeEmbeddingModel`. */
     @Volatile private var embeddingModel: GemmaEmbeddingModel? = null
+
+    /** Non-null only when an EmbeddingGemma 2 model is initialised with UniversalEmbedder. */
+    @Volatile private var universalEmbedder: UniversalEmbedder? = null
+    @Volatile private var targetDimension: Int? = null
 
     /**
      * Temp files (model copy and/or tokenizer copy) created by Strategy B.
@@ -134,6 +149,102 @@ class EmbeddingPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
             /**
              * Initialises the embedding model.
+             *
+             * Arguments:
+             *   - `modelPath`     (String) – absolute path **or** `content://` URI
+             *                               to the `.tflite` embedding model.
+             *   - `tokenizerPath` (String) – absolute path **or** `content://` URI
+             *                               to the SentencePiece tokeniser file.
+             *   - `useGpu`        (Boolean, optional) – default false; ignored on emulators.
+             */
+            /**
+             * Initialises EmbeddingGemma 2 via MediaPipe Tasks UniversalEmbedder.
+             */
+            "initEmbeddingGemma2" -> {
+                val modelPath = call.argument<String>("modelPath")
+                val accelerator = call.argument<String>("accelerator")
+                val maxInputSequenceLength = call.argument<Int>("maxInputSequenceLength")
+                val visionTokenBudget = call.argument<Int>("visionTokenBudget")
+                val targetDim = call.argument<Int>("targetDimension")
+
+                if (modelPath.isNullOrEmpty()) {
+                    result.error("INVALID_ARG", "modelPath must not be empty.", null)
+                    return
+                }
+
+                ioScope.launch {
+                    safeResultCall(result, "EMBED_INIT_ERROR") {
+                        loadUniversalEmbedder(
+                            modelPath,
+                            accelerator,
+                            maxInputSequenceLength,
+                            visionTokenBudget,
+                            targetDim
+                        )
+                        null
+                    }
+                }
+            }
+
+            /**
+             * Generates a semantic embedding vector for one or more encoded images.
+             */
+            "generateImagesEmbedding" -> {
+                val images = call.argument<List<ByteArray>>("images")
+                if (images.isNullOrEmpty()) {
+                    result.success(emptyList<Double>())
+                    return
+                }
+                ioScope.launch {
+                    safeResultCall(result, "EMBED_IMAGES_ERROR") {
+                        embedImages(images)
+                    }
+                }
+            }
+
+            /**
+             * Generates an embedding vector for interleaved multimodal parts.
+             */
+            "generateMultimodalEmbedding" -> {
+                val parts = call.argument<List<Map<String, Any>>>("parts")
+                if (parts.isNullOrEmpty()) {
+                    result.success(emptyList<Double>())
+                    return
+                }
+                ioScope.launch {
+                    safeResultCall(result, "EMBED_MULTIMODAL_ERROR") {
+                        embedMultimodal(parts)
+                    }
+                }
+            }
+
+            /**
+             * Checks if audio embedding is supported.
+             */
+            "supportsAudio" -> {
+                result.success(universalEmbedder != null)
+            }
+
+            /**
+             * Returns SoC identifiers used to select a chipset-optimised model variant.
+             */
+            "getSocInfo" -> {
+                val soc = if (android.os.Build.VERSION.SDK_INT >= 31) android.os.Build.SOC_MODEL else ""
+                val socMaker = if (android.os.Build.VERSION.SDK_INT >= 31) android.os.Build.SOC_MANUFACTURER else ""
+                result.success(
+                    mapOf(
+                        "socModel" to (soc ?: ""),
+                        "socManufacturer" to (socMaker ?: ""),
+                        "hardware" to (android.os.Build.HARDWARE ?: ""),
+                        "board" to (android.os.Build.BOARD ?: ""),
+                        "device" to (android.os.Build.DEVICE ?: ""),
+                        "model" to (android.os.Build.MODEL ?: ""),
+                    )
+                )
+            }
+
+            /**
+             * Initialises the legacy embedding model.
              *
              * Arguments:
              *   - `modelPath`     (String) – absolute path **or** `content://` URI
@@ -251,6 +362,14 @@ class EmbeddingPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
      * is sufficient. Also cleans up any surviving temp files.
      */
     private fun unloadModel() {
+        try {
+            universalEmbedder?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing UniversalEmbedder: ${e.message}")
+        }
+        universalEmbedder = null
+        activeUniversalEmbedder = null
+        targetDimension = null
         embeddingModel = null
         deletePendingTempFiles("unloadModel")
         Log.i(TAG, "Embedding model unloaded.")
@@ -495,9 +614,130 @@ class EmbeddingPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
      *
      * @throws IllegalStateException if the model is not loaded.
      */
+    private fun loadUniversalEmbedder(
+        rawModelPath: String,
+        accelerator: String?,
+        maxInputSequenceLength: Int?,
+        visionTokenBudget: Int?,
+        targetDim: Int?
+    ) {
+        val modelPath = resolveFilePath(rawModelPath, isTokenizer = false)
+        try {
+            val delegate = when (accelerator?.lowercase()) {
+                "gpu" -> if (isRunningOnEmulator()) Delegate.CPU else Delegate.GPU
+                "npu" -> Delegate.NPU
+                else -> Delegate.CPU
+            }
+            val baseOptions = BaseOptions.builder()
+                .setModelAssetPath(modelPath)
+                .setDelegate(delegate)
+                .build()
+            val optionsBuilder = UniversalEmbedderOptions.builder()
+                .setBaseOptions(baseOptions)
+                .setL2Normalize(true)
+            if (maxInputSequenceLength != null && maxInputSequenceLength > 0) {
+                optionsBuilder.setMaxInputLength(maxInputSequenceLength)
+            }
+            if (visionTokenBudget != null && visionTokenBudget > 0) {
+                optionsBuilder.setVisionTokensPerImage(visionTokenBudget)
+            }
+            optionsBuilder.setAudioDelegate(Delegate.CPU)
+            val embedder = UniversalEmbedder.createFromOptions(appContext, optionsBuilder.build())
+            universalEmbedder = embedder
+            activeUniversalEmbedder = embedder
+            targetDimension = targetDim
+            deletePendingTempFiles("UniversalEmbedder loaded")
+            Log.i(TAG, "EmbeddingGemma 2 (UniversalEmbedder) initialized successfully on $delegate")
+        } catch (e: Exception) {
+            deletePendingTempFiles("UniversalEmbedder init failed")
+            throw e
+        }
+    }
+
+    private fun embedImages(images: List<ByteArray>): List<Double> {
+        val uEmbedder = universalEmbedder
+            ?: throw IllegalStateException("EmbeddingGemma 2 not initialised.")
+        val res = uEmbedder.embedContent(images.map { it as Any })
+        val floats = res.embeddings().firstOrNull()?.floatEmbedding() ?: return emptyList()
+        return processEmbeddingOutput(floats)
+    }
+
+    private fun embedMultimodal(parts: List<Map<String, Any>>): List<Double> {
+        val uEmbedder = universalEmbedder
+            ?: throw IllegalStateException("EmbeddingGemma 2 not initialised.")
+        val content = mutableListOf<Any>()
+        for (part in parts) {
+            val type = part["type"] as? String ?: continue
+            when (type) {
+                "text" -> {
+                    val text = part["text"] as? String
+                    if (!text.isNullOrEmpty()) content.add(text)
+                }
+                "image" -> {
+                    val bytes = part["bytes"] as? ByteArray
+                    if (bytes != null && bytes.isNotEmpty()) content.add(bytes)
+                }
+                "audio" -> {
+                    val bytes = part["bytes"] as? ByteArray
+                    val sampleRate = (part["sampleRateHz"] as? Number)?.toInt() ?: 16000
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        val shortBuffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                        val shorts = ShortArray(shortBuffer.remaining())
+                        shortBuffer.get(shorts)
+                        val format = AudioData.AudioDataFormat.builder()
+                            .setNumOfChannels(1)
+                            .setSampleRate(sampleRate.toFloat())
+                            .build()
+                        val audioData = AudioData.create(format, shorts.size).apply { load(shorts) }
+                        content.add(audioData)
+                    }
+                }
+            }
+        }
+        val res = uEmbedder.embedContent(content)
+        val floats = res.embeddings().firstOrNull()?.floatEmbedding() ?: return emptyList()
+        return processEmbeddingOutput(floats)
+    }
+
+    private fun processEmbeddingOutput(floats: FloatArray): List<Double> {
+        val dim = targetDimension
+        val effectiveFloats = if (dim != null && dim < floats.size) {
+            val truncated = floats.copyOf(dim)
+            l2Normalize(truncated)
+        } else {
+            l2Normalize(floats)
+        }
+        return effectiveFloats.map { it.toDouble() }
+    }
+
+    private fun l2Normalize(vec: FloatArray): FloatArray {
+        var sum = 0.0
+        for (v in vec) sum += v * v
+        val norm = sqrt(sum)
+        if (norm > 0) {
+            for (i in vec.indices) vec[i] = (vec[i] / norm).toFloat()
+        }
+        return vec
+    }
+
+    /**
+     * Runs the embedding model over [text] and returns the float vector as
+     * `List<Double>` (Flutter's standard number type).
+     *
+     * Uses [SEMANTIC_SIMILARITY] task type, appropriate for RAG retrieval.
+     *
+     * @throws IllegalStateException if the model is not loaded.
+     */
     private suspend fun computeEmbedding(text: String): List<Double> {
+        val uEmbedder = universalEmbedder
+        if (uEmbedder != null) {
+            val res = uEmbedder.embedContent(listOf(text))
+            val floats = res.embeddings().firstOrNull()?.floatEmbedding() ?: return emptyList()
+            return processEmbeddingOutput(floats)
+        }
+
         val model = embeddingModel
-            ?: throw IllegalStateException("Embedding model not initialised. Call initEmbeddingModel first.")
+            ?: throw IllegalStateException("Embedding model not initialised. Call initEmbeddingModel or initEmbeddingGemma2 first.")
 
         val embedData = EmbedData.builder<String>()
             .setData(text)
@@ -512,7 +752,7 @@ class EmbeddingPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             return emptyList()
         }
 
-        return embeddings.map { it.toDouble() }
+        return processEmbeddingOutput(embeddings.toFloatArray())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -534,6 +774,11 @@ class EmbeddingPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         } catch (e: Exception) {
             Log.e(TAG, "$errorCode: ${e.message}", e)
             withContext(Dispatchers.Main) { result.error(errorCode, e.message, null) }
+        } catch (e: LinkageError) {
+            Log.e(TAG, "$errorCode (native linkage): ${e.message}", e)
+            withContext(Dispatchers.Main) {
+                result.error(errorCode, "Native library/class linkage error: ${e.message}", null)
+            }
         }
     }
 }

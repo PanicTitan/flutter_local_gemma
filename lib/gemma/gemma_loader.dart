@@ -1,6 +1,9 @@
 import 'package:flutter/foundation.dart';
+import '../embedding/embedding_plugin.dart';
+import '../helpers/model_loader.dart';
 import 'gemma.dart';
 import 'gemma_model.dart';
+import 'gemma_state.dart';
 
 /// High-level model lifecycle helper.
 ///
@@ -40,6 +43,27 @@ class GemmaLoader {
   /// [maxTokens] sets the KV-cache capacity.
   /// [useGpu] selects the GPU backend (set to false on unsupported devices).
   /// [onProgress] receives download progress in [0.0, 100.0].
+  /// [supportAudio] overrides whether the audio backend is initialised;
+  /// defaults to [GemmaModel.supportsAudio] (pass `false` to skip it even on
+  /// an audio-capable model, e.g. to save memory when you know you won't
+  /// use audio input).
+  ///
+  /// **Safely swaps models.** If a *different* model is already loaded, that
+  /// model is disposed before the new one is initialised — calling
+  /// [FlutterLocalGemma.init] directly again with a different model would
+  /// otherwise silently no-op (it's a no-op whenever a model is already
+  /// loaded) and leave the old model running natively while callers assume
+  /// [model] is now active. If [model] is already the one that's loaded,
+  /// this returns immediately without downloading or reloading anything
+  /// (pass [forceReload] to force a reload anyway).
+  ///
+  /// Tracks [GemmaState.loadState] throughout: [ModelLoadState.downloading]
+  /// during the download, then [ModelLoadState.loading] /
+  /// [ModelLoadState.loaded] / [ModelLoadState.error] exactly as
+  /// [FlutterLocalGemma.init] does. Throws a [StateError] instead of racing
+  /// an already-in-flight download/load/unload — check
+  /// `GemmaState.instance.isLoadBusy` in your UI to disable the "load"
+  /// action while one is in progress.
   ///
   /// Returns the local path of the installed model file.
   static Future<String> loadGemmaModel(
@@ -47,31 +71,81 @@ class GemmaLoader {
     String? token,
     int maxTokens = 4096,
     bool useGpu = true,
+    bool? supportAudio,
     void Function(double)? onProgress,
+    bool forceReload = false,
   }) async {
+    if (GemmaState.instance.isLoadBusy) {
+      throw StateError(
+        'A model download/load/unload is already in progress '
+        '(GemmaState.instance.loadState == '
+        '${GemmaState.instance.loadState.value}). Wait for it to finish '
+        'before loading another model.',
+      );
+    }
+
     final url = kIsWeb ? model.webUrl : model.androidUrl;
     final fileName = kIsWeb ? model.webFile : model.androidFile;
 
     final installer = ModelInstaller(fileName: fileName);
     String path;
 
-    if (onProgress != null) {
-      path = await installer
-          .fromNetwork(url, token: token)
-          .withProgress(onProgress)
-          .install();
-    } else {
-      path = await installer.fromNetwork(url, token: token).install();
+    GemmaState.instance.setLastError(null);
+    GemmaState.instance.setLoadState(ModelLoadState.downloading);
+    try {
+      if (kIsWeb && model.isOnnx) {
+        path = model.webUrl;
+      } else if (onProgress != null) {
+        path = await installer
+            .fromNetwork(url, token: token)
+            .withProgress(onProgress)
+            .install();
+      } else {
+        path = await installer.fromNetwork(url, token: token).install();
+      }
+    } catch (e) {
+      GemmaState.instance.setLastError(e);
+      GemmaState.instance.setLoadState(ModelLoadState.error);
+      rethrow;
     }
 
-    // Initialise the engine after successful download.
-    await FlutterLocalGemma().init(InferenceConfig(
+    if (model.isEmbedding) {
+      await EmbeddingPlugin().init(EmbeddingConfig.gemma2(
+        modelPathOrId: path,
+        token: token,
+        onProgress: onProgress,
+      ));
+      GemmaState.instance.setLoadState(ModelLoadState.loaded);
+      return path;
+    }
+
+    final gemma = FlutterLocalGemma();
+    final alreadyThisModel = gemma.isInitialized && gemma.currentModelPath == path;
+    if (alreadyThisModel && !forceReload) {
+      // Nothing else to do — restore `loaded` since we parked the state at
+      // `downloading` above, even though nothing was actually downloaded
+      // beyond a cache check.
+      GemmaState.instance.setLoadState(ModelLoadState.loaded);
+      return path;
+    }
+
+    if (gemma.isInitialized) {
+      // Unload whatever is currently loaded first — init() would otherwise
+      // silently no-op and leave the *old* model running natively while
+      // the caller assumes [model] is now active.
+      await gemma.dispose();
+    }
+
+    // Initialise the engine after successful download. init() takes over
+    // GemmaState tracking from here (downloading -> loading -> loaded/error).
+    await gemma.init(InferenceConfig(
       modelPath: path,
       maxTokens: maxTokens,
       backend: useGpu ? PreferredBackend.gpu : PreferredBackend.cpu,
-      supportAudio: model.supportsAudio,
+      supportAudio: supportAudio ?? model.supportsAudio,
       enableMtp: model.supportsMtp, // auto-detected on Android anyway
       modelName: fileName,
+      onProgress: onProgress,
     ));
 
     return path;
@@ -81,7 +155,7 @@ class GemmaLoader {
 
   /// Returns true if the model file appears to be cached locally.
   ///
-  /// On Web: checks the OPFS listing for the model filename.
+  /// On Web: checks the OPFS listing or browser Cache Storage for the model.
   /// On Android: always returns `true` when the engine is already initialised
   /// with this model (i.e. [FlutterLocalGemma.currentModelPath] ends with the
   /// model filename). A full cache check requires a file-system stat not
@@ -89,6 +163,9 @@ class GemmaLoader {
   /// installer determine whether to download or use the cached file.
   static Future<bool> isModelCached(GemmaModel model) async {
     if (kIsWeb) {
+      if (model.isOnnx) {
+        return (await PluginModelLoader.modelCachedAt(model)) != null;
+      }
       final fileName = model.webFile;
       try {
         final files = await ModelInstaller.listWebCache();
@@ -97,36 +174,22 @@ class GemmaLoader {
         return false;
       }
     } else {
-      // Android: check if the engine currently has this model loaded.
+      if (model.isEmbedding) {
+        return (await PluginModelLoader.modelCachedAt(model)) != null;
+      }
       final path = FlutterLocalGemma().currentModelPath;
       if (path != null && path.endsWith(model.androidFile)) return true;
-      // Cannot stat the file without additional platform channel support;
-      // return false and let loadGemmaModel decide at install time.
-      return false;
+      return (await PluginModelLoader.modelCachedAt(model)) != null;
     }
   }
 
   /// Returns true if the model is cached AND ready for use (no re-download needed).
-  static Future<bool> isModelReady(GemmaModel model) => isModelCached(model);
+  static Future<bool> isModelReady(GemmaModel model) =>
+      PluginModelLoader.isModelReady(model);
 
   /// Returns the local cache date for the model file, or null if not available.
-  ///
-  /// Currently only supported on Web via OPFS metadata.
-  static Future<DateTime?> modelCachedAt(GemmaModel model) async {
-    if (!kIsWeb) return null; // Android path not yet exposed
-    try {
-      final files = await ModelInstaller.listWebCache();
-      final entry = files.firstWhere(
-        (f) => (f['name'] as String?) == model.webFile,
-        orElse: () => {},
-      );
-      final ts = entry['lastModified'];
-      if (ts is int) return DateTime.fromMillisecondsSinceEpoch(ts);
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
+  static Future<DateTime?> modelCachedAt(GemmaModel model) =>
+      PluginModelLoader.modelCachedAt(model);
 
   // ── Cache management ───────────────────────────────────────────────────────
 
@@ -142,9 +205,7 @@ class GemmaLoader {
   /// await GemmaLoader.purgeModel(GemmaModel.gemma4E2B);
   /// ```
   static Future<void> purgeModel(GemmaModel model) async {
-    // TODO: When ModelInstaller exposes single-file deletion, use it here.
-    // For now we fall through to purgeCache which clears everything.
-    await ModelInstaller.purgeCache();
+    await PluginModelLoader.deleteModel(model);
   }
 
   /// Deletes all cached model files.

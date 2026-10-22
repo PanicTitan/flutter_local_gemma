@@ -19,7 +19,7 @@ external void _generateResponse(JSAny parts, JSFunction callback);
 external void _cancelProcessing();
 
 @JS('unloadLLM')
-external void _unloadLLM();
+external JSPromise<JSAny?> _unloadLLM();
 
 @JS('countTokens')
 external JSPromise<JSNumber> _countTokens(JSString text);
@@ -62,20 +62,30 @@ class FlutterLocalGemmaWeb {
     final int safeMaxTokens = config.maxTokens.clamp(512, 8192);
     options.setProperty('maxTokens'.toJS, safeMaxTokens.toJS);
 
-    // IMPORTANT: Do NOT pass supportAudio=true for Gemma 4 web models.
-    // Gemma 4's WASM binary does not include the audio modality — passing
-    // supportAudio causes a 'RuntimeError: memory access out of bounds' crash
-    // during GPU init.  We detect Gemma 4 by its well-known path substrings.
-    // Note: E2B and E4B are Gemma 3 variants and DO support audio/images.
+    final modelPathLower = config.modelPath.toLowerCase();
+    final isModelOnnx = modelPathLower.contains('onnx') ||
+                        modelPathLower.endsWith('.onnx');
     _isGemma4 = FlutterLocalGemma().currentModelIsGemma4;
+    final supportsVision = FlutterLocalGemma().currentModelSupportsVision;
+    final supportsAudio = FlutterLocalGemma().currentModelSupportsAudio;
 
     if (config.maxNumImages != null) {
-      options.setProperty('maxNumImages'.toJS, _isGemma4 ? 0.toJS : config.maxNumImages!.toJS);
+      options.setProperty('maxNumImages'.toJS, (!supportsVision) ? 0.toJS : config.maxNumImages!.toJS);
     }
 
-    final effectiveSupportAudio = config.supportAudio && !_isGemma4;
+    final effectiveSupportAudio = config.supportAudio && supportsAudio;
     options.setProperty('supportAudio'.toJS, effectiveSupportAudio.toJS);
-    options.setProperty('isGemma4'.toJS, _isGemma4.toJS);
+    options.setProperty('isGemma4'.toJS, (_isGemma4 && !isModelOnnx).toJS);
+    options.setProperty('isOnnx'.toJS, isModelOnnx.toJS);
+
+    if (config.onProgress != null) {
+      options.setProperty(
+        'onProgress'.toJS,
+        ((JSNumber p) {
+          config.onProgress!(p.toDartDouble);
+        }).toJS,
+      );
+    }
 
     await _initLLM(options).toDart;
   }
@@ -83,11 +93,13 @@ class FlutterLocalGemmaWeb {
 
   /// Releases the LLM instance and all associated GPU memory from the browser.
   /// After this call [init] must be called again before generating.
-  void unload() {
+  Future<void> unload() async {
     _activeController?.close();
     _activeController = null;
     _webBuffer.clear();
-    _unloadLLM();
+    try {
+      await _unloadLLM().toDart;
+    } catch (_) {}
   }
 
   // ── Buffer helpers ────────────────────────────────────────────────────────

@@ -121,6 +121,24 @@ class JsSkillExecutor(private val context: Context) {
         }
     }
 
+    /**
+     * Releases the pooled [WebView] (and its JS bridge) for a single skill,
+     * without touching any other skill's WebView. Call this when a skill is
+     * unregistered or replaced so its (potentially tens-of-MB) WebView isn't
+     * held in memory until the whole plugin is torn down.
+     */
+    fun releaseSkill(skillName: String) {
+        mainHandler.post {
+            val wv = pool.remove(skillName)
+            interfacePool.remove(skillName)
+            if (wv != null) {
+                wv.removeJavascriptInterface("AiEdgeGallery")
+                wv.destroy()
+                Log.d(TAG, "Released WebView for skill '$skillName'")
+            }
+        }
+    }
+
     fun dispose() {
         mainHandler.post {
             pool.values.forEach {

@@ -82,8 +82,8 @@ void main() {
 
         // Find the TestRunnerScreen's state to inspect the suite.
         final screenState = tester
-            .state<_TestRunnerScreenState>(find.byType(TestRunnerScreen));
-        final suite = screenState._suitePublic;
+            .state<TestRunnerScreenState>(find.byType(TestRunnerScreen));
+        final suite = screenState.suite;
 
         if (!suite.isRunning) break; // All done.
       }
@@ -92,8 +92,8 @@ void main() {
       await tester.pumpAndSettle();
 
       final screenState = tester
-          .state<_TestRunnerScreenState>(find.byType(TestRunnerScreen));
-      final suite = screenState._suitePublic;
+          .state<TestRunnerScreenState>(find.byType(TestRunnerScreen));
+      final suite = screenState.suite;
 
       // 6. Assert — skip-typed tests don't count as failures.
       final failures = suite.cases.where(
@@ -116,13 +116,3 @@ void main() {
     timeout: Timeout.none,
   );
 }
-
-// Allow the integration test to access the private state for inspection.
-// This extension method mirrors how the real screen stores the suite.
-extension on _TestRunnerScreenState {
-  TestSuite get _suitePublic => _suitePublic;
-}
-
-// Re-export the private type so the extension above compiles.
-// (The actual class is in test_runner_screen.dart.)
-typedef _TestRunnerScreenState = State<TestRunnerScreen>;

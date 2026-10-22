@@ -14,7 +14,7 @@ class FlutterLocalGemmaWeb {
   Future<void> init(InferenceConfig config) async =>
       throw UnimplementedError('Web engine unavailable on this platform.');
 
-  void unload() =>
+  Future<void> unload() async =>
       throw UnimplementedError('Web engine unavailable on this platform.');
 
   void addToBuffer(List<ContentPart> parts) =>

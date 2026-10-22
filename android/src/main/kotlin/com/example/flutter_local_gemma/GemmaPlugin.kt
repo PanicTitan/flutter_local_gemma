@@ -82,6 +82,9 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
 
                     /** Copy-buffer size: 8 MB gives good throughput without RAM pressure. */
                     private const val COPY_BUFFER_BYTES = 8 * 1024 * 1024
+
+                    /** Guards [loadEngine] so `System.loadLibrary` is only attempted once per process. */
+                    @Volatile private var nativeLibLoadAttempted = false
           }
 
           // ── Flutter channels ──────────────────────────────────────────────────────
@@ -179,7 +182,7 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                               when (call.method) {
                                         "registerSkills" -> {
                                                   val skills = call.argument<List<Map<String, Any>>>("skills") ?: emptyList()
-                                                  agentToolSet?.registeredSkills = skills.mapNotNull {
+                                                  val newDefs = skills.mapNotNull {
                                                             val name = it["name"] as? String ?: return@mapNotNull null
                                                             val desc = it["description"] as? String ?: return@mapNotNull null
                                                             val inst = it["instructions"] as? String ?: return@mapNotNull null
@@ -187,6 +190,15 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                                                             val timeoutMs = (it["timeoutMs"] as? Number)?.toLong() ?: 30_000L
                                                             GemmaAgentToolSet.SkillDef(name, desc, inst, scriptHtml, if (timeoutMs > 0) timeoutMs else Long.MAX_VALUE)
                                                   }
+
+                                                  // Free the pooled WebView (each one holds a real WebView + WASM/JS
+                                                  // heap, tens of MB) for any skill that is no longer registered,
+                                                  // instead of only releasing it when the whole plugin is torn down.
+                                                  val oldNames = agentToolSet?.registeredSkills?.map { it.name }?.toSet() ?: emptySet()
+                                                  val newNames = newDefs.map { it.name }.toSet()
+                                                  (oldNames - newNames).forEach { jsSkillExecutor.releaseSkill(it) }
+
+                                                  agentToolSet?.registeredSkills = newDefs
                                                   result.success(null)
                                         }
                                         "executeJsSkill" -> {
@@ -195,13 +207,13 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                                                   val argsJson = call.argument<String>("argsJson") ?: "{}"
                                                   val secret = call.argument<String>("secret") ?: ""
                                                   val timeoutMs = call.argument<Int>("timeoutMs")?.toLong() ?: 30_000L
-                                                  
+                                                 
                                                   val skill = agentToolSet?.registeredSkills?.find { it.name == skillName }
                                                   if (skill == null || skill.scriptHtml == null) {
                                                             result.error("NOT_FOUND", "Skill not found or has no HTML", null)
                                                             return@setMethodCallHandler
                                                   }
-                                                  
+                                                 
                                                   ioScope.launch {
                                                             try {
                                                                       val res = jsSkillExecutor.execute(
@@ -243,7 +255,7 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                               "createModel" -> {
                                         val modelPath          = call.argument<String>("modelPath") ?: ""
                                         val maxTokens          = call.argument<Int>("maxTokens") ?: 1024
-                                        val backendIdx      = call.argument<Int>("preferredBackend") ?: 0
+                                        val backendIdx      = call.argument<Int>("preferredBackend") ?: 1
                                         val supportAudio = call.argument<Boolean>("supportAudio") ?: false
                                         ioScope.launch {
                                                   safeResultCall(result) {
@@ -302,9 +314,28 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                                         result.success(null)
                               }
 
+                              /**
+                                  * Zero-copy variant of `addImage`: takes an on-disk path instead of
+                                  * bytes, so the image never has to be read into a Dart ByteData /
+                                  * MethodChannel buffer at all. Preferred when the image already
+                                  * lives on disk (camera capture, picked file, cached download).
+                                  */
+                              "addImageFile" -> {
+                                        call.argument<String>("path")?.takeIf { it.isNotEmpty() }
+                                                  ?.let { synchronized(pendingContent) { pendingContent.add(Content.ImageFile(it)) } }
+                                        result.success(null)
+                              }
+
                               "addAudio" -> {
                                         call.argument<ByteArray>("audioBytes")
                                                   ?.let { synchronized(pendingContent) { pendingContent.add(Content.AudioBytes(it)) } }
+                                        result.success(null)
+                              }
+
+                              /** Zero-copy variant of `addAudio` — see `addImageFile`. */
+                              "addAudioFile" -> {
+                                        call.argument<String>("path")?.takeIf { it.isNotEmpty() }
+                                                  ?.let { synchronized(pendingContent) { pendingContent.add(Content.AudioFile(it)) } }
                                         result.success(null)
                               }
 
@@ -387,12 +418,21 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                                         validateModelFile(resolvedPath)
                               }
 
-                              try { System.loadLibrary("litertlm_jni") }
-                              catch (e: UnsatisfiedLinkError) { Log.w(TAG, "JNI auto-loaded by AAR: ") }
+                              if (!nativeLibLoadAttempted) {
+                                        nativeLibLoadAttempted = true
+                                        try { System.loadLibrary("litertlm_jni") }
+                                        catch (e: UnsatisfiedLinkError) { Log.w(TAG, "JNI auto-loaded by AAR: ") }
+                              }
 
                               var speculativeSupported = false
-                              com.google.ai.edge.litertlm.Capabilities(resolvedPath).use {
-                                        speculativeSupported = it.hasSpeculativeDecodingSupport()
+                              try {
+                                        ModelInfo.from(resolvedPath).use { modelInfo ->
+                                                  if (modelInfo is ModelInfo.Llm) {
+                                                            speculativeSupported = modelInfo.hasSpeculativeDecodingSupport()
+                                                  }
+                                        }
+                              } catch (e: Throwable) {
+                                        Log.w(TAG, "Could not inspect speculative decoding support: ${e.message}")
                               }
                               if (speculativeSupported) {
                                         ExperimentalFlags.enableSpeculativeDecoding = true
@@ -401,24 +441,51 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                                         ExperimentalFlags.enableSpeculativeDecoding = false
                               }
 
-                              val backend = if (backendIdx == 1) Backend.GPU() else Backend.CPU()
-                              val config     = EngineConfig(
-                                        modelPath           = resolvedPath,
-                                        maxNumTokens     = maxTokens,
-                                        backend                = backend,
-                                        visionBackend = Backend.GPU(),
-                                        audioBackend     = if (audio) Backend.CPU() else null,
+                              // GPU is the default for both the main (text) backend and the vision
+                              // backend — Dart defaults `InferenceConfig.backend` to
+                              // `PreferredBackend.gpu` unless the caller explicitly asks for CPU
+                              // (backendIdx == 0). Audio has no GPU delegate in LiteRT-LM, so it is
+                              // always CPU regardless of `backendIdx` when `supportAudio` is set.
+                              val wantsGpu     = backendIdx != 0
+                              val audioBackend = if (audio) Backend.CPU() else null
+
+                              fun buildConfig(useGpu: Boolean) = EngineConfig(
+                                        modelPath       = resolvedPath,
+                                        maxNumTokens    = maxTokens,
+                                        backend         = if (useGpu) Backend.GPU() else Backend.CPU(),
+                                        visionBackend   = if (useGpu) Backend.GPU() else Backend.CPU(),
+                                        audioBackend    = audioBackend,
+                                        // Lets LiteRT cache compiled OpenCL/GPU kernels across model loads
+                                        // instead of recompiling the delegate every time the engine is
+                                        // created — meaningfully speeds up subsequent GPU loads.
+                                        cacheDir        = appContext.cacheDir.path,
                               )
 
-                              val newEngine = Engine(config)
-                              newEngine.initialize()      // throws on failure → caught below
+                              var newEngine: Engine
+                              var usedGpu = wantsGpu
+                              try {
+                                        newEngine = Engine(buildConfig(wantsGpu))
+                                        newEngine.initialize()      // throws on failure → caught below
+                              } catch (gpuEx: Exception) {
+                                        if (wantsGpu) {
+                                                  // GPU delegate init can fail on devices with missing/broken
+                                                  // OpenCL drivers. Retry once on CPU so createModel() doesn't
+                                                  // hard-fail whenever GPU is unavailable.
+                                                  Log.w(TAG, "GPU engine init failed (${gpuEx.message}) – falling back to CPU.")
+                                                  usedGpu = false
+                                                  newEngine = Engine(buildConfig(false))
+                                                  newEngine.initialize()
+                                        } else {
+                                                  throw gpuEx
+                                        }
+                              }
                               engine = newEngine                // only reached on success
 
                               // Delete the Strategy B temp file now that the engine has it open.
                               // LiteRT likely mmap()'d it; storage freed when the engine closes.
                               deletePendingTempFile("model loaded successfully")
 
-                              Log.i(TAG, "Engine ready – backend=$backend maxTokens=$maxTokens")
+                              Log.i(TAG, "Engine ready – backend=${if (usedGpu) "GPU" else "CPU"} maxTokens=$maxTokens")
                     } catch (e: Exception) {
                               deletePendingTempFile("init failed – cleaning up")
                               deleteGpuCacheFiles("init failed – cleaning up")
@@ -432,7 +499,7 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
           private fun openConversation(temp: Float, topP: Float, topK: Int, systemPrompt: String?, enableThinking: Boolean, nativeToolCalling: Boolean) {
                     val eng = engine ?: throw IllegalStateException("Engine not initialised. Call createModel first.")
                     closeConversation()
-                    
+                   
                     this.isThinkingEnabled = enableThinking
 
                     // ConversationConfig only accepts an optional system Message.
@@ -442,7 +509,7 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                     val sysMsg: Contents? = systemPrompt
                               ?.takeIf { it.isNotBlank() }
                               ?.let { Contents.of(listOf(Content.Text(it))) }
-                              
+                             
                     // Dart handles all tool intercepts via the unified stream loop.
                     // Passing tools to the C++ engine enables constrained decoding, which
                     // forces the model to use the multiplexer (execute_skill) and conflicts
@@ -833,11 +900,11 @@ class GemmaPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel
                                                             if (e !is CancellationException && e.message?.contains("CANCELLED") == false)
                                                                       withContext(Dispatchers.Main) { sendStreamError(e.message ?: "Generation error") }
                                                   }
-                                                  .onCompletion { 
+                                                  .onCompletion {
                                                             if (wasThinking) {
                                                                       withContext(Dispatchers.Main) { sendStreamPartial("<channel|>") }
                                                             }
-                                                            withContext(Dispatchers.Main) { sendStreamDone() } 
+                                                            withContext(Dispatchers.Main) { sendStreamDone() }
                                                   }
                                                   .collect { partial ->
                                                             val textToken = partial.toString()

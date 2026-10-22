@@ -10,6 +10,7 @@ import 'package:flutter_local_gemma/chat/tool_call_parser.dart';
 
 import 'gemma_response.dart';
 import 'gemma_skill.dart';
+import 'gemma_state.dart';
 import '../chat/base_chat.dart';
 import '../chat/gemma_chat.dart';
 import 'gemma_web.dart' if (dart.library.io) 'gemma_stub.dart';
@@ -172,6 +173,11 @@ class AgentChat implements BaseChat {
     final toolArgs =
         (data['args'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
     if (skillName == null) return {'error': 'Missing skillName'};
+    // Native (Kotlin) calls back into Dart via the `executeTool` MethodChannel
+    // invocation for `nativeToolCalling: true` sessions — this is a separate
+    // code path from the Dart-side tool-call parsing loop below, so it needs
+    // its own `toolCalling` state transition to stay in sync.
+    GemmaState.instance.setInferenceState(GemmaInferenceState.toolCalling);
     final resultJson = await _dispatchSkill(skillName, toolArgs);
     return {'result': resultJson};
   }
@@ -291,7 +297,34 @@ class AgentChat implements BaseChat {
 
   // ── Main agent loop ────────────────────────────────────────────────────────
 
+  /// Streams [AgentTurn]s for [message], running the tool-call loop
+  /// internally.
+  ///
+  /// Tracks [GemmaState.inferenceState] for the whole run: set to
+  /// [GemmaInferenceState.processingInput] immediately, refined to
+  /// [GemmaInferenceState.thinking]/[GemmaInferenceState.answering] as
+  /// tokens stream in, and to [GemmaInferenceState.toolCalling] while a
+  /// dispatched skill is executing. Always settles back to
+  /// [GemmaInferenceState.idle] (or [GemmaInferenceState.error]) when the
+  /// stream ends — including if the caller cancels it early — via a
+  /// `finally` block, so the state can never get stuck on a stale value.
   Stream<AgentTurn> run(String message) async* {
+    GemmaState.instance.setLastError(null);
+    GemmaState.instance.setInferenceState(GemmaInferenceState.processingInput);
+    try {
+      yield* _runAgentLoop(message);
+    } catch (e) {
+      GemmaState.instance.setLastError(e);
+      GemmaState.instance.setInferenceState(GemmaInferenceState.error);
+      rethrow;
+    } finally {
+      if (GemmaState.instance.inferenceState.value != GemmaInferenceState.error) {
+        GemmaState.instance.setInferenceState(GemmaInferenceState.idle);
+      }
+    }
+  }
+
+  Stream<AgentTurn> _runAgentLoop(String message) async* {
     final bool isNativeMode = config.nativeToolCalling == true && !kIsWeb;
 
     String currentMessage = message;
@@ -333,6 +366,7 @@ class AgentChat implements BaseChat {
 
       await for (final response in parsedStream) {
         if (response is GemmaThinkingResponse) {
+          GemmaState.instance.setInferenceState(GemmaInferenceState.thinking);
           currentThinking += response.content;
 
           final currentRawText = [
@@ -355,6 +389,7 @@ class AgentChat implements BaseChat {
             isComplete: false,
           );
         } else if (response is GemmaTextResponse) {
+          GemmaState.instance.setInferenceState(GemmaInferenceState.answering);
           if (currentThinking.isNotEmpty) {
             thinkingBlocks.add(currentThinking);
             currentThinking = '';
@@ -514,6 +549,7 @@ class AgentChat implements BaseChat {
           lastToolCallName = toolResult.name;
           lastToolCallArgsStr = argsStr;
 
+          GemmaState.instance.setInferenceState(GemmaInferenceState.toolCalling);
           final resultJson = await _dispatchSkill(
             toolResult.name,
             toolResult.args,

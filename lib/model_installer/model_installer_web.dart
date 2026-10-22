@@ -20,7 +20,33 @@ external JSPromise<JSArray<JSObject>> _jsListOpfsCache();
 @JS('purgeEmbeddingCache')
 external JSPromise<JSNumber> _jsPurgeEmbeddingCache(JSArray<JSString> patterns);
 
+@JS('isTransformersModelCached')
+external JSPromise<JSBoolean> _jsIsTransformersModelCached(JSString pattern);
+
+@JS('deleteTransformersModel')
+external JSPromise<JSBoolean> _jsDeleteTransformersModel(JSString pattern);
+
 // ─────────────────────────────────────────────────────────────────────────────
+
+Future<bool> isTransformersModelCachedImpl(String pattern) async {
+  await WebScriptLoader.ensureJsLoaded();
+  try {
+    final res = await _jsIsTransformersModelCached(pattern.toJS).toDart;
+    return res.toDart;
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<bool> deleteTransformersModelImpl(String pattern) async {
+  await WebScriptLoader.ensureJsLoaded();
+  try {
+    final res = await _jsDeleteTransformersModel(pattern.toJS).toDart;
+    return res.toDart;
+  } catch (_) {
+    return false;
+  }
+}
 
 ModelDownloaderBuilder createDownloader(
   String url,
